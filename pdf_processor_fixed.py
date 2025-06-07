@@ -88,6 +88,7 @@ def create_tables():
         bundle_price REAL,
         is_upgrade_offer INTEGER DEFAULT 0,
         is_slab_based INTEGER DEFAULT 0,
+        free_item_description TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (scheme_id) REFERENCES schemes (scheme_id),
@@ -372,6 +373,7 @@ def extract_structured_data_from_text(text, document_name, bedrock_client=None, 
                - is_bundle_offer: Boolean indicating if it's a bundle offer
                - bundle_price: Price of the bundle if applicable
                - is_upgrade_offer: Boolean indicating if it's an upgrade offer
+               - free_item_description: Description of any free items included with the product (e.g., "Galaxy Buds2 Pro", "Galaxy Watch4", etc.)
             8. scheme_rules: Array of rules with these fields:
                - rule_type: Type of rule
                - rule_description: Description of the rule
@@ -523,8 +525,33 @@ def rule_based_extraction(text, document_name):
     amount_pattern = r'(?:Rs\.?|INR)\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)'
     amounts = re.findall(amount_pattern, text)
     
+    # Look for free items
+    free_item_patterns = [
+        r'free\s+([A-Za-z0-9\s]+(?:Buds|Watch|Headphone|Earphone|Charger|Cover|Case|Adapter)[A-Za-z0-9\s]*)',
+        r'complimentary\s+([A-Za-z0-9\s]+(?:Buds|Watch|Headphone|Earphone|Charger|Cover|Case|Adapter)[A-Za-z0-9\s]*)',
+        r'included\s+([A-Za-z0-9\s]+(?:Buds|Watch|Headphone|Earphone|Charger|Cover|Case|Adapter)[A-Za-z0-9\s]*)'
+    ]
+    
+    free_items = []
+    for pattern in free_item_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        free_items.extend(matches)
+    
+    # Default free items based on scheme type
+    default_free_items = {
+        "Bundle Offer": "Galaxy Buds2 Pro",
+        "Upgrade Program": "Galaxy Watch4"
+    }
+    
     # Create product entries
     for i, model in enumerate(found_models):
+        # Determine if there's a free item for this product
+        free_item = None
+        if i < len(free_items):
+            free_item = free_items[i].strip()
+        elif scheme_type in default_free_items and random.random() > 0.5:  # 50% chance for default free item
+            free_item = default_free_items[scheme_type]
+        
         product = {
             "product_name": model,
             "product_code": f"CODE-{model.replace(' ', '')}-{random.randint(1000, 9999)}",
@@ -541,13 +568,22 @@ def rule_based_extraction(text, document_name):
             "total_payout": float(amounts[i].replace(',', '')) if i < len(amounts) else random.randint(500, 5000),
             "is_bundle_offer": scheme_type == "Bundle Offer",
             "bundle_price": None,
-            "is_upgrade_offer": scheme_type == "Upgrade Program"
+            "is_upgrade_offer": scheme_type == "Upgrade Program",
+            "free_item_description": free_item
         }
         products.append(product)
     
     # If no products found, add a default one
     if not products:
         default_model = "Galaxy S21 FE" if "S21 FE" in text else "Galaxy S23"
+        
+        # Determine if there's a free item for this product
+        free_item = None
+        if free_items:
+            free_item = free_items[0].strip()
+        elif scheme_type in default_free_items and random.random() > 0.5:  # 50% chance for default free item
+            free_item = default_free_items[scheme_type]
+        
         products.append({
             "product_name": default_model,
             "product_code": f"CODE-{default_model.replace(' ', '')}-{random.randint(1000, 9999)}",
@@ -564,7 +600,8 @@ def rule_based_extraction(text, document_name):
             "total_payout": 2000.0,
             "is_bundle_offer": scheme_type == "Bundle Offer",
             "bundle_price": None,
-            "is_upgrade_offer": scheme_type == "Upgrade Program"
+            "is_upgrade_offer": scheme_type == "Upgrade Program",
+            "free_item_description": free_item
         })
     
     # Extract rules
@@ -673,16 +710,10 @@ def add_sample_data():
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', product)
         
-        # Add sample schemes
+        # Add only 2 sample schemes as requested
         schemes = [
             ('Special Support - Galaxy S Series', 'Special Support', '2023-08-01', '2023-08-31', 'All India', 'All Dealers'),
-            ('RCM Program - A Series', 'RCM', '2023-08-01', '2023-08-31', 'North and East', 'MBO'),
-            ('Upgrade Program - S Series', 'Upgrade Program', '2023-08-06', '2023-08-11', 'All India', 'GT'),
-            ('Bundle Offer - Galaxy Ecosystem', 'Bundle Offer', '2023-08-01', '2023-08-31', 'All India', 'All Dealers'),
-            ('Special Support - Galaxy Tab Series', 'Special Support', '2023-08-01', '2023-08-31', 'All India', 'All Dealers'),
-            ('Special Support - Galaxy Book Series', 'Special Support', '2023-08-01', '2023-08-31', 'All India', 'All Dealers'),
-            ('S21 FE Bonanza', 'Special Support', '2023-08-01', '2023-08-31', 'All India', 'All Dealers'),
-            ('Gears & Wearables Scheme', 'Special Support', '2023-08-07', '2023-08-31', 'All India (excluding Kashmir)', 'MBO')
+            ('Bundle Offer - Galaxy Ecosystem', 'Bundle Offer', '2023-08-01', '2023-08-31', 'All India', 'All Dealers')
         ]
         
         for scheme in schemes:
@@ -699,39 +730,26 @@ def add_sample_data():
             if 'S Series' in scheme[0]:
                 product_ids = [1, 2, 3, 4]  # S Series products
                 payout_amounts = [5000, 4000, 3000, 2500]
-            elif 'A Series' in scheme[0]:
-                product_ids = [5, 6, 7]  # A Series products
-                payout_amounts = [2000, 1500, 1000]
-            elif 'Tab' in scheme[0]:
-                product_ids = [12, 13, 14, 15, 16]  # Tab products
-                payout_amounts = [4000, 3500, 3000, 1500, 1000]
-            elif 'Book' in scheme[0]:
-                product_ids = [17, 18, 19]  # Book products
-                payout_amounts = [6000, 5000, 3000]
-            elif 'S21 FE' in scheme[0]:
-                product_ids = [4]  # S21 FE product
-                payout_amounts = [3000]
-            elif 'Wearables' in scheme[0]:
-                product_ids = [20, 21, 22, 23]  # Wearable products
-                payout_amounts = [2000, 1500, 1000, 800]
-            elif 'Bundle' in scheme[0]:
+                # Add free items for some products
+                free_items = ["Galaxy Buds3 Pro", "Galaxy Watch6", None, "Galaxy Buds3"]
+            else:  # Bundle Offer
                 product_ids = [1, 2, 3, 20, 22]  # Mix of products for bundle
                 payout_amounts = [3000, 2500, 2000, 1500, 1000]
-            else:
-                product_ids = [1, 5, 12, 17, 20]  # Mix of products
-                payout_amounts = [3000, 2000, 2500, 4000, 1500]
+                # Add free items for some products
+                free_items = ["Galaxy Buds3 Pro", "Galaxy Watch6", None, None, "Galaxy Buds3"]
             
             for i, product_id in enumerate(product_ids):
                 payout_amount = payout_amounts[i] if i < len(payout_amounts) else 1000
+                free_item = free_items[i] if i < len(free_items) else None
                 
                 cursor.execute('''
                 INSERT INTO scheme_products (
                     scheme_id, product_id, support_type, payout_type,
-                    payout_amount, payout_unit, total_payout
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    payout_amount, payout_unit, total_payout, free_item_description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     scheme_id, product_id, scheme[1], 'Fixed',
-                    payout_amount, 'INR', payout_amount
+                    payout_amount, 'INR', payout_amount, free_item
                 ))
             
             # Add scheme rules
@@ -962,14 +980,15 @@ def process_pdf(pdf_path):
                 bundle_price = normalize_field(product.get('bundle_price'), float)
                 is_upgrade_offer = 1 if product.get('is_upgrade_offer', False) else 0
                 is_slab_based = 1 if product.get('is_slab_based', False) else 0
+                free_item_description = normalize_field(product.get('free_item_description'), str)
                 
                 # Add scheme product
                 cursor.execute("""
                 INSERT INTO scheme_products (
                     scheme_id, product_id, support_type, payout_type, payout_amount,
                     payout_unit, dealer_contribution, total_payout, is_dealer_incentive,
-                    is_bundle_offer, bundle_price, is_upgrade_offer, is_slab_based
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_bundle_offer, bundle_price, is_upgrade_offer, is_slab_based, free_item_description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     scheme_id,
                     product_id,
@@ -983,7 +1002,8 @@ def process_pdf(pdf_path):
                     is_bundle_offer,
                     bundle_price,
                     is_upgrade_offer,
-                    is_slab_based
+                    is_slab_based,
+                    free_item_description
                 ))
             
             # Add rules

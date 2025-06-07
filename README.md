@@ -34,17 +34,11 @@ dns_complete/
    - Initialize the database
    - Copy sample PDFs to the schemes directory
    - Set up the secrets file
-
-3. **Process Scheme PDFs**:
-   ```bash
-   python pdf_processor_fixed.py
-   ```
-   This will:
    - Extract data from all PDFs in the schemes directory
    - Populate the database with scheme details
    - Create sample dealers and sales data
 
-4. **Run the Application**:
+3. **Run the Application**:
    ```bash
    streamlit run app.py
    ```
