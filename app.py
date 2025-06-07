@@ -622,34 +622,59 @@ def render_schemes():
     col1, col2 = st.columns(2)
     
     with col1:
+        # Get unique regions from schemes
+        regions = ["All"]
+        for scheme in get_active_schemes():
+            if "applicable_region" in scheme.keys():
+                region = scheme["applicable_region"]
+                if region and region not in regions:
+                    regions.append(region)
+        
         filter_region = st.selectbox(
             "Region",
-            ["All"] + list(set(scheme['applicable_region'] for scheme in get_active_schemes())),
+            regions,
             key="filter_region"
         )
     
     with col2:
+        # Get unique scheme types
+        scheme_types = ["All"]
+        for scheme in get_active_schemes():
+            if "scheme_type" in scheme.keys():
+                scheme_type = scheme["scheme_type"]
+                if scheme_type and scheme_type not in scheme_types:
+                    scheme_types.append(scheme_type)
+        
         filter_type = st.selectbox(
             "Scheme Type",
-            ["All"] + list(set(scheme['scheme_type'] for scheme in get_active_schemes())),
+            scheme_types,
             key="filter_type"
         )
     
     # Apply filters
     filtered_schemes = get_active_schemes()
     if filter_region != "All":
-        filtered_schemes = [s for s in filtered_schemes if s['applicable_region'] == filter_region]
+        filtered_schemes = [s for s in filtered_schemes if "applicable_region" in s.keys() and s["applicable_region"] == filter_region]
     if filter_type != "All":
-        filtered_schemes = [s for s in filtered_schemes if s['scheme_type'] == filter_type]
+        filtered_schemes = [s for s in filtered_schemes if "scheme_type" in s.keys() and s["scheme_type"] == filter_type]
     
     # Display schemes as cards
     for scheme in filtered_schemes:
         st.markdown("<div class=\"card\">", unsafe_allow_html=True)
-        st.markdown(f"### {scheme['scheme_name']}")
-        st.markdown(f"**Type:** {scheme['scheme_type']}")
-        st.markdown(f"**Period:** {scheme['scheme_period_start']} to {scheme['scheme_period_end']}")
-        st.markdown(f"**Region:** {scheme['applicable_region']}")
-        st.markdown(f"**Dealer Eligibility:** {scheme['dealer_type_eligibility']}")
+        
+        # Safely access scheme attributes
+        scheme_name = scheme["scheme_name"] if "scheme_name" in scheme.keys() else "Unnamed Scheme"
+        scheme_type = scheme["scheme_type"] if "scheme_type" in scheme.keys() else "Unknown Type"
+        period_start = scheme["scheme_period_start"] if "scheme_period_start" in scheme.keys() else "Unknown"
+        period_end = scheme["scheme_period_end"] if "scheme_period_end" in scheme.keys() else "Unknown"
+        region = scheme["applicable_region"] if "applicable_region" in scheme.keys() else "Unknown"
+        eligibility = scheme["dealer_type_eligibility"] if "dealer_type_eligibility" in scheme.keys() else "Unknown"
+        
+        st.markdown(f"### {scheme_name}")
+        st.markdown(f"**Type:** {scheme_type}")
+        st.markdown(f"**Period:** {period_start} to {period_end}")
+        st.markdown(f"**Region:** {region}")
+        st.markdown(f"**Dealer Eligibility:** {eligibility}")
         
         if st.button("View Details", key=f"view_scheme_{scheme['scheme_id']}"):
             st.session_state.current_scheme = scheme["scheme_id"]
@@ -670,21 +695,31 @@ def render_scheme_details():
         st.error("Scheme not found.")
         return
     
-    st.markdown(f"<h1 class='main-header'>{scheme['scheme_name']}</h1>", unsafe_allow_html=True)
+    # Safely access scheme attributes
+    scheme_name = scheme["scheme_name"] if "scheme_name" in scheme.keys() else "Unnamed Scheme"
+    scheme_type = scheme["scheme_type"] if "scheme_type" in scheme.keys() else "Unknown Type"
+    period_start = scheme["scheme_period_start"] if "scheme_period_start" in scheme.keys() else "Unknown"
+    period_end = scheme["scheme_period_end"] if "scheme_period_end" in scheme.keys() else "Unknown"
+    region = scheme["applicable_region"] if "applicable_region" in scheme.keys() else "Unknown"
+    eligibility = scheme["dealer_type_eligibility"] if "dealer_type_eligibility" in scheme.keys() else "Unknown"
+    deal_status = scheme["deal_status"] if "deal_status" in scheme.keys() else "Unknown"
+    approval_status = scheme["approval_status"] if "approval_status" in scheme.keys() else "Unknown"
+    
+    st.markdown(f"<h1 class='main-header'>{scheme_name}</h1>", unsafe_allow_html=True)
     
     # Scheme details
     st.markdown("<h2 class='sub-header'>Scheme Details</h2>", unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown(f"**Type:** {scheme['scheme_type']}")
-        st.markdown(f"**Period:** {scheme['scheme_period_start']} to {scheme['scheme_period_end']}")
-        st.markdown(f"**Region:** {scheme['applicable_region']}")
+        st.markdown(f"**Type:** {scheme_type}")
+        st.markdown(f"**Period:** {period_start} to {period_end}")
+        st.markdown(f"**Region:** {region}")
     
     with col2:
-        st.markdown(f"**Dealer Eligibility:** {scheme['dealer_type_eligibility']}")
-        st.markdown(f"**Status:** {scheme['deal_status']}")
-        st.markdown(f"**Approval Status:** {scheme['approval_status']}")
+        st.markdown(f"**Dealer Eligibility:** {eligibility}")
+        st.markdown(f"**Status:** {deal_status}")
+        st.markdown(f"**Approval Status:** {approval_status}")
     
     # Products in scheme
     st.markdown("<h2 class='sub-header'>Products</h2>", unsafe_allow_html=True)
@@ -692,14 +727,25 @@ def render_scheme_details():
     
     for product in products:
         st.markdown("<div class=\"card\">", unsafe_allow_html=True)
-        st.markdown(f"### {product['product_name']} ({product['product_code']})")
-        st.markdown(f"**Category:** {product['product_category']}")
-        st.markdown(f"**Support Type:** {product['support_type']}")
-        st.markdown(f"**Payout:** {product['payout_amount']} {product['payout_unit']} ({product['payout_type']})")
+        
+        # Safely access product attributes
+        product_name = product["product_name"] if "product_name" in product.keys() else "Unnamed Product"
+        product_code = product["product_code"] if "product_code" in product.keys() else "Unknown Code"
+        product_category = product["product_category"] if "product_category" in product.keys() else "Unknown Category"
+        support_type = product["support_type"] if "support_type" in product.keys() else "Unknown Support"
+        payout_type = product["payout_type"] if "payout_type" in product.keys() else "Unknown Payout Type"
+        payout_amount = product["payout_amount"] if "payout_amount" in product.keys() else 0
+        payout_unit = product["payout_unit"] if "payout_unit" in product.keys() else "INR"
+        
+        st.markdown(f"### {product_name} ({product_code})")
+        st.markdown(f"**Category:** {product_category}")
+        st.markdown(f"**Support Type:** {support_type}")
+        st.markdown(f"**Payout:** {payout_amount} {payout_unit} ({payout_type})")
         
         # Display free item if available
-        if product['free_item_description']:
-            st.markdown(f"<div class='free-item-highlight'>🎁 FREE: {product['free_item_description']}</div>", unsafe_allow_html=True)
+        free_item = product["free_item_description"] if "free_item_description" in product.keys() else None
+        if free_item:
+            st.markdown(f"<div class='free-item-highlight'>🎁 FREE: {free_item}</div>", unsafe_allow_html=True)
         
         st.markdown("</div>", unsafe_allow_html=True)
     
@@ -708,7 +754,11 @@ def render_scheme_details():
     rules = get_scheme_rules(scheme_id)
     
     for rule in rules:
-        st.markdown(f"**{rule['rule_type']}:** {rule['rule_description']}")
+        # Safely access rule attributes
+        rule_type = rule["rule_type"] if "rule_type" in rule.keys() else "General"
+        rule_description = rule["rule_description"] if "rule_description" in rule.keys() else "No description"
+        
+        st.markdown(f"**{rule_type}:** {rule_description}")
     
     # Back button
     if st.button("Back to Schemes"):
@@ -844,12 +894,22 @@ def render_approvals():
     
     for scheme in pending_schemes:
         st.markdown("<div class=\"card\">", unsafe_allow_html=True)
-        st.markdown(f"### {scheme['scheme_name']}")
-        st.markdown(f"**Type:** {scheme['scheme_type']}")
-        st.markdown(f"**Period:** {scheme['scheme_period_start']} to {scheme['scheme_period_end']}")
-        st.markdown(f"**Region:** {scheme['applicable_region']}")
-        st.markdown(f"**Dealer Eligibility:** {scheme['dealer_type_eligibility']}")
-        st.markdown(f"**Uploaded:** {scheme['upload_timestamp']}")
+        
+        # Safely access scheme attributes
+        scheme_name = scheme["scheme_name"] if "scheme_name" in scheme.keys() else "Unnamed Scheme"
+        scheme_type = scheme["scheme_type"] if "scheme_type" in scheme.keys() else "Unknown Type"
+        period_start = scheme["scheme_period_start"] if "scheme_period_start" in scheme.keys() else "Unknown"
+        period_end = scheme["scheme_period_end"] if "scheme_period_end" in scheme.keys() else "Unknown"
+        region = scheme["applicable_region"] if "applicable_region" in scheme.keys() else "Unknown"
+        eligibility = scheme["dealer_type_eligibility"] if "dealer_type_eligibility" in scheme.keys() else "Unknown"
+        upload_timestamp = scheme["upload_timestamp"] if "upload_timestamp" in scheme.keys() else "Unknown"
+        
+        st.markdown(f"### {scheme_name}")
+        st.markdown(f"**Type:** {scheme_type}")
+        st.markdown(f"**Period:** {period_start} to {period_end}")
+        st.markdown(f"**Region:** {region}")
+        st.markdown(f"**Dealer Eligibility:** {eligibility}")
+        st.markdown(f"**Uploaded:** {upload_timestamp}")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -886,18 +946,30 @@ def render_simulate_sales():
     with col1:
         # Select dealer
         dealers = get_all_dealers()
-        dealer_options = {dealer["dealer_id"]: dealer["dealer_name"] for dealer in dealers}
+        dealer_options = {}
+        for dealer in dealers:
+            if "dealer_id" in dealer.keys() and "dealer_name" in dealer.keys():
+                dealer_options[dealer["dealer_id"]] = dealer["dealer_name"]
+        
         dealer_id = st.selectbox("Select Dealer", options=list(dealer_options.keys()), format_func=lambda x: dealer_options[x])
         
         # Select scheme
         schemes = get_active_schemes()
-        scheme_options = {scheme["scheme_id"]: scheme["scheme_name"] for scheme in schemes}
+        scheme_options = {}
+        for scheme in schemes:
+            if "scheme_id" in scheme.keys() and "scheme_name" in scheme.keys():
+                scheme_options[scheme["scheme_id"]] = scheme["scheme_name"]
+        
         scheme_id = st.selectbox("Select Scheme", options=list(scheme_options.keys()), format_func=lambda x: scheme_options[x])
     
     with col2:
         # Select product based on scheme
         products = get_scheme_products(scheme_id) if scheme_id else []
-        product_options = {product["product_id"]: product["product_name"] for product in products}
+        product_options = {}
+        for product in products:
+            if "product_id" in product.keys() and "product_name" in product.keys():
+                product_options[product["product_id"]] = product["product_name"]
+        
         product_id = st.selectbox("Select Product", options=list(product_options.keys()), format_func=lambda x: product_options[x]) if products else None
         
         # Quantity
@@ -910,25 +982,39 @@ def render_simulate_sales():
     
     if product_id and scheme_id:
         # Find the selected product in the scheme products
-        selected_product = next((p for p in products if p["product_id"] == product_id), None)
+        selected_product = None
+        for p in products:
+            if "product_id" in p.keys() and p["product_id"] == product_id:
+                selected_product = p
+                break
         
         if selected_product:
             # Calculate dealer price (simplified for simulation)
-            dealer_price = selected_product.get("dealer_price", 10000)  # Default value if not specified
+            # Safely access dealer_price or use default
+            try:
+                dealer_price = selected_product["dealer_price"] if "dealer_price" in selected_product.keys() else 10000
+            except (KeyError, TypeError):
+                dealer_price = 10000  # Default value if not specified
             
             # Calculate incentive based on payout type
-            payout_type = selected_product["payout_type"]
-            payout_amount = selected_product["payout_amount"]
-            
-            if payout_type == "Fixed":
-                incentive = payout_amount * quantity
-            elif payout_type == "Percentage":
-                incentive = (dealer_price * payout_amount / 100) * quantity
-            else:
-                incentive = payout_amount * quantity
+            try:
+                payout_type = selected_product["payout_type"] if "payout_type" in selected_product.keys() else "Fixed"
+                payout_amount = selected_product["payout_amount"] if "payout_amount" in selected_product.keys() else 1000
+                
+                if payout_type == "Fixed":
+                    incentive = payout_amount * quantity
+                elif payout_type == "Percentage":
+                    incentive = (dealer_price * payout_amount / 100) * quantity
+                else:
+                    incentive = payout_amount * quantity
+            except (KeyError, TypeError):
+                incentive = 1000 * quantity  # Default value if calculation fails
             
             # Check for free item
-            free_item = selected_product.get("free_item_description")
+            try:
+                free_item = selected_product["free_item_description"] if "free_item_description" in selected_product.keys() else None
+            except (KeyError, TypeError):
+                free_item = None
     
     # Display calculated values
     if dealer_price is not None and incentive is not None:

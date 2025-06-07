@@ -21,7 +21,7 @@ def setup_environment():
             "aws_secret_access_key": "REPLACE",
             "INFERENCE_PROFILE_CLAUDE": "arn:aws:bedrock:ap-south-1:273354629305:inference-profile/apac.anthropic.claude-3-5-sonnet-20241022-v2:0",
             "REGION": "ap-south-1",
-            "TAVILY_API": "tvly-REPLACE",
+            "TAVILY_API": "tvly-dev-REPLACE",
             "FAISS_INDEX_PATH": "faiss_index.bin",
             "METADATA_STORE_PATH": "metadata_store.pkl",
             "s3_bucket_name": "cw-dns-v1",
