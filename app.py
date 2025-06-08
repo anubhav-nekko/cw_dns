@@ -1,1109 +1,1999 @@
 import streamlit as st
+import sqlite3
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import os
-import sqlite3
 import json
 import datetime
 import uuid
-import random
-from functools import lru_cache
+import tempfile
+import shutil
+from pdf_processor_fixed import extract_text_from_pdf, extract_structured_data_from_text, connect_db, initialize_aws_clients
 
-# Import functions from pdf_processor_fixed
-from pdf_processor_fixed import (
-    connect_db as get_db_connection, 
-    extract_text_from_pdf, 
-    extract_structured_data_from_text, 
-    add_sample_data, 
-    create_tables
+# Set page configuration
+st.set_page_config(
+    page_title="Dealer Nudging System (DNS)",
+    page_icon="📱",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# --- Configuration & Setup ---
-st.set_page_config(layout="wide", page_title="Dealer Nudging System")
-
-# --- Global State & Session Management ---
-if "page" not in st.session_state:
-    st.session_state.page = "dashboard"
-if "current_scheme" not in st.session_state:
-    st.session_state.current_scheme = None
-if "uploaded_pdf" not in st.session_state:
-    st.session_state.uploaded_pdf = None
-if "extracted_text" not in st.session_state:
-    st.session_state.extracted_text = None
-if "structured_data" not in st.session_state:
-    st.session_state.structured_data = None
-if "simulation_results" not in st.session_state:
-    st.session_state.simulation_results = None
-if "show_simulation_results" not in st.session_state:
-    st.session_state.show_simulation_results = False
-
-# --- Utility Functions ---
-def navigate_to(page_name):
-    """Navigate to a different page in the application"""
-    st.session_state.page = page_name
-    st.rerun()
-
-@lru_cache(maxsize=128)
-def load_secrets():
-    """Load secrets from secrets.json"""
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    secrets_path = os.path.join(current_dir, "secrets.json")
-    try:
-        with open(secrets_path, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        st.error("secrets.json not found. Please ensure the file exists.")
-        return {}
-    except json.JSONDecodeError:
-        st.error("Error decoding secrets.json. Please check the file format.")
-        return {}
-
-def save_uploaded_pdf(uploaded_file):
-    """Save uploaded PDF to the uploads directory"""
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    uploads_dir = os.path.join(current_dir, "uploads")
-    os.makedirs(uploads_dir, exist_ok=True)
-    
-    # Generate a unique filename to avoid overwrites
-    unique_filename = f"{uuid.uuid4().hex[:8]}_{uploaded_file.name}"
-    pdf_path = os.path.join(uploads_dir, unique_filename)
-    
-    with open(pdf_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return pdf_path
-
-# --- Database Interaction Functions ---
-@lru_cache(maxsize=32)
-def get_active_schemes():
-    """Get all active and approved schemes from the database"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-            SELECT * FROM schemes 
-            WHERE deal_status = ? AND approval_status = ? 
-            ORDER BY scheme_period_end DESC
-            LIMIT 2
-            """, (
-                "Active", "Approved"
-            ))
-            return cursor.fetchall()
-        finally:
-            conn.close()
-    return []
-
-@lru_cache(maxsize=32)
-def get_all_products():
-    """Get all products from the database"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM products WHERE is_active = 1 ORDER BY product_name")
-            return cursor.fetchall()
-        finally:
-            conn.close()
-    return []
-
-@lru_cache(maxsize=32)
-def get_all_dealers():
-    """Get all dealers from the database"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM dealers WHERE is_active = 1 ORDER BY dealer_name")
-            return cursor.fetchall()
-        finally:
-            conn.close()
-    return []
-
-@lru_cache(maxsize=128)
-def get_scheme_products(scheme_id):
-    """Get products associated with a specific scheme"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-            SELECT p.*, sp.support_type, sp.payout_type, sp.payout_amount, 
-                   sp.payout_unit, sp.dealer_contribution, sp.total_payout,
-                   sp.is_bundle_offer, sp.bundle_price, sp.is_upgrade_offer,
-                   sp.free_item_description
-            FROM products p
-            JOIN scheme_products sp ON p.product_id = sp.product_id
-            WHERE sp.scheme_id = ? AND p.is_active = 1
-            """, (scheme_id,))
-            return cursor.fetchall()
-        finally:
-            conn.close()
-    return []
-
-@lru_cache(maxsize=128)
-def get_scheme_details(scheme_id):
-    """Get details for a specific scheme"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM schemes WHERE scheme_id = ?", (scheme_id,))
-            return cursor.fetchone()
-        finally:
-            conn.close()
-    return None
-
-@lru_cache(maxsize=128)
-def get_scheme_rules(scheme_id):
-    """Get rules for a specific scheme"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM scheme_rules WHERE scheme_id = ?", (scheme_id,))
-            return cursor.fetchall()
-        finally:
-            conn.close()
-    return []
-
-@lru_cache(maxsize=128)
-def get_payout_slabs(scheme_product_id):
-    """Get payout slabs for a specific scheme product"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM payout_slabs WHERE scheme_product_id = ?", (scheme_product_id,))
-            return cursor.fetchall()
-        finally:
-            conn.close()
-    return []
-
-@lru_cache(maxsize=32)
-def get_pending_approvals():
-    """Get schemes pending approval"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-            SELECT * FROM schemes 
-            WHERE approval_status = ? 
-            ORDER BY upload_timestamp DESC
-            """, (
-                "Pending",
-            ))
-            return cursor.fetchall()
-        finally:
-            conn.close()
-    return []
-
-@lru_cache(maxsize=128)
-def get_sales_data(days=30):
-    """Get sales data for the last N days"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            end_date = datetime.datetime.now()
-            start_date = end_date - datetime.timedelta(days=days)
-            
-            query = """
-            SELECT 
-                st.sale_id, 
-                st.sale_timestamp, 
-                d.dealer_name, 
-                d.region, 
-                p.product_name, 
-                p.product_category, 
-                s.scheme_name, 
-                st.quantity_sold, 
-                st.dealer_price_dp, 
-                st.earned_dealer_incentive_amount, 
-                st.verification_status
-            FROM sales_transactions st
-            JOIN dealers d ON st.dealer_id = d.dealer_id
-            JOIN products p ON st.product_id = p.product_id
-            JOIN schemes s ON st.scheme_id = s.scheme_id
-            WHERE st.sale_timestamp BETWEEN ? AND ?
-            ORDER BY st.sale_timestamp DESC
-            """
-            cursor.execute(query, (start_date.strftime("%Y-%m-%d %H:%M:%S"), end_date.strftime("%Y-%m-%d %H:%M:%S")))
-            return cursor.fetchall()
-        finally:
-            conn.close()
-    return []
-
-def add_new_scheme_from_data(structured_data, pdf_path):
-    """Add a new scheme to the database from structured data"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            
-            # Normalize fields from pdf_processor_fixed
-            from pdf_processor_fixed import normalize_field
-            
-            # Add scheme
-            scheme_name = normalize_field(structured_data.get("scheme_name"), str, f"Scheme from {os.path.basename(pdf_path)}")
-            scheme_type = normalize_field(structured_data.get("scheme_type"), str, "Special Support")
-            scheme_period_start = normalize_field(structured_data.get("scheme_period_start"), str, "2023-01-01")
-            scheme_period_end = normalize_field(structured_data.get("scheme_period_end"), str, "2023-12-31")
-            applicable_region = normalize_field(structured_data.get("applicable_region"), str, "All India")
-            dealer_type_eligibility = normalize_field(structured_data.get("dealer_type_eligibility"), str, "All Dealers")
-            
-            cursor.execute("""
-            INSERT INTO schemes (
-                scheme_name, scheme_type, scheme_period_start, scheme_period_end,
-                applicable_region, dealer_type_eligibility, scheme_document_name,
-                raw_extracted_text_path, deal_status, approval_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                scheme_name,
-                scheme_type,
-                scheme_period_start,
-                scheme_period_end,
-                applicable_region,
-                dealer_type_eligibility,
-                os.path.basename(pdf_path),
-                pdf_path,  # Assuming raw_extracted_text_path is the PDF path for now
-                "Active",
-                "Pending"
-            ))
-            scheme_id = cursor.lastrowid
-            
-            # Add products
-            for product_data in structured_data.get("products", []):
-                product_name = normalize_field(product_data.get("product_name"), str, f"Product {uuid.uuid4().hex[:8]}")
-                product_code = normalize_field(product_data.get("product_code"), str, f"CODE-{uuid.uuid4().hex[:8]}")
-                product_category = normalize_field(product_data.get("product_category"), str, "Mobile")
-                
-                cursor.execute("SELECT product_id FROM products WHERE product_name = ? AND product_code = ?", (product_name, product_code))
-                existing_product = cursor.fetchone()
-                
-                if existing_product:
-                    product_id = existing_product["product_id"]
-                else:
-                    cursor.execute("""
-                    INSERT INTO products (product_name, product_code, product_category) 
-                    VALUES (?, ?, ?)
-                    """, (product_name, product_code, product_category))
-                    product_id = cursor.lastrowid
-                
-                # Add scheme product
-                support_type = normalize_field(product_data.get("support_type"), str, scheme_type)
-                payout_type = normalize_field(product_data.get("payout_type"), str, "Fixed")
-                payout_amount = normalize_field(product_data.get("payout_amount"), float, 1000.0)
-                payout_unit = normalize_field(product_data.get("payout_unit"), str, "INR")
-                free_item_description = normalize_field(product_data.get("free_item_description"), str)
-                
-                cursor.execute("""
-                INSERT INTO scheme_products (
-                    scheme_id, product_id, support_type, payout_type, payout_amount, 
-                    payout_unit, free_item_description
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    scheme_id, product_id, support_type, payout_type, payout_amount, 
-                    payout_unit, free_item_description
-                ))
-            
-            # Add rules
-            for rule_data in structured_data.get("scheme_rules", []):
-                rule_type = normalize_field(rule_data.get("rule_type"), str, "General")
-                rule_description = normalize_field(rule_data.get("rule_description"), str, "No description")
-                rule_value = normalize_field(rule_data.get("rule_value"), str)
-                
-                cursor.execute("""
-                INSERT INTO scheme_rules (scheme_id, rule_type, rule_description, rule_value) 
-                VALUES (?, ?, ?, ?)
-                """, (scheme_id, rule_type, rule_description, rule_value))
-            
-            conn.commit()
-            return scheme_id
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Error saving scheme to database: {e}")
-            return None
-        finally:
-            conn.close()
-    return None
-
-def update_scheme_status(scheme_id, status, approved_by="Admin"):
-    """Update the approval status of a scheme"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-            UPDATE schemes 
-            SET approval_status = ?, approved_by = ?, approval_timestamp = CURRENT_TIMESTAMP
-            WHERE scheme_id = ?
-            """, (status, approved_by, scheme_id))
-            conn.commit()
-            return True
-        except Exception as e:
-            st.error(f"Error updating scheme status: {e}")
-            return False
-        finally:
-            conn.close()
-    return False
-
-def add_simulated_sale(dealer_id, product_id, scheme_id, quantity, dealer_price, incentive):
-    """Add a simulated sale to the database"""
-    conn = get_db_connection()
-    if conn:
-        try:
-            cursor = conn.cursor()
-            imei = "SIM-" + ",".join(["".join([str(random.randint(0, 9)) for _ in range(15)]) for _ in range(quantity)])
-            
-            cursor.execute("""
-            INSERT INTO sales_transactions (
-                dealer_id, product_id, scheme_id, quantity_sold, 
-                dealer_price_dp, earned_dealer_incentive_amount, 
-                imei_serial, verification_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                dealer_id, product_id, scheme_id, quantity, 
-                dealer_price, incentive, imei, "Simulated"
-            ))
-            conn.commit()
-            return True
-        except Exception as e:
-            st.error(f"Error adding simulated sale: {e}")
-            return False
-        finally:
-            conn.close()
-    return False
-
-# --- UI Rendering Functions ---
-
 # Custom CSS
-def load_custom_css():
-    """Load custom CSS for styling"""
-    st.markdown("""
-    <style>
-        /* Main header style */
-        .main-header {
-            color: #1E90FF; /* DodgerBlue */
-            text-align: center;
-            padding-bottom: 20px;
-            border-bottom: 2px solid #1E90FF;
-        }
-        /* Sub-header style */
-        .sub-header {
-            color: #4682B4; /* SteelBlue */
-            margin-top: 20px;
-            margin-bottom: 10px;
-            border-bottom: 1px solid #ADD8E6; /* LightBlue */
-            padding-bottom: 5px;
-        }
-        /* Card style for displaying data */
-        .card {
-            background-color: #F0F8FF; /* AliceBlue */
-            border-radius: 10px;
-            padding: 15px;
-            margin-bottom: 15px;
-            box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
-        }
-        /* Status indicators */
-        .status-approved {
-            color: green;
-            font-weight: bold;
-        }
-        .status-pending {
-            color: orange;
-            font-weight: bold;
-        }
-        .status-rejected {
-            color: red;
-            font_weight: bold;
-        }
-        /* Highlight free items */
-        .free-item-highlight {
-            background-color: #FFFFE0; /* LightYellow */
-            color: #8B4513; /* SaddleBrown */
-            padding: 5px;
-            border-radius: 5px;
-            font-weight: bold;
-            display: inline-block;
-            margin-top: 5px;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1E88E5;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        font-size: 1.8rem;
+        color: #0D47A1;
+        margin-top: 2rem;
+        margin-bottom: 1rem;
+    }
+    .card {
+        background-color: #f9f9f9;
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        margin-bottom: 20px;
+    }
+    .metric-card {
+        background-color: #e3f2fd;
+        border-radius: 10px;
+        padding: 15px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        text-align: center;
+    }
+    .metric-value {
+        font-size: 2rem;
+        font-weight: bold;
+        color: #1565C0;
+    }
+    .metric-label {
+        font-size: 1rem;
+        color: #424242;
+    }
+    .highlight {
+        background-color: #ffecb3;
+        padding: 2px 5px;
+        border-radius: 3px;
+    }
+    .free-item-alert {
+        background-color: #e8f5e9;
+        border-left: 5px solid #4caf50;
+        padding: 15px;
+        margin: 10px 0;
+        border-radius: 5px;
+    }
+    .scheme-card {
+        background-color: #f5f5f5;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 15px;
+        border-left: 4px solid #2196F3;
+    }
+    .approval-pending {
+        border-left: 4px solid #FFC107;
+    }
+    .approval-approved {
+        border-left: 4px solid #4CAF50;
+    }
+    .approval-rejected {
+        border-left: 4px solid #F44336;
+    }
+    .edit-mode {
+        background-color: #fff8e1;
+    }
+    .table-container {
+        overflow-x: auto;
+    }
+    .stButton>button {
+        background-color: #1976D2;
+        color: white;
+        font-weight: 500;
+    }
+    .stButton>button:hover {
+        background-color: #1565C0;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Sidebar navigation
+# Load secrets
+def load_secrets():
+    """Load AWS and API secrets from secrets.json"""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    secrets_path = os.path.join(current_dir, 'secrets.json')
+    
+    try:
+        with open(secrets_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Error loading secrets: {e}")
+        return {}
+
+# Initialize session state
+def init_session_state():
+    """Initialize session state variables"""
+    if 'page' not in st.session_state:
+        st.session_state.page = 'dashboard'
+    
+    if 'edit_mode' not in st.session_state:
+        st.session_state.edit_mode = False
+    
+    if 'edited_scheme' not in st.session_state:
+        st.session_state.edited_scheme = None
+    
+    if 'edited_products' not in st.session_state:
+        st.session_state.edited_products = None
+    
+    if 'approval_requests' not in st.session_state:
+        st.session_state.approval_requests = []
+    
+    if 'notifications' not in st.session_state:
+        st.session_state.notifications = []
+    
+    if 'selected_scheme_id' not in st.session_state:
+        st.session_state.selected_scheme_id = None
+    
+    if 'selected_dealer_id' not in st.session_state:
+        st.session_state.selected_dealer_id = None
+    
+    if 'selected_product_id' not in st.session_state:
+        st.session_state.selected_product_id = None
+
+# Navigation
 def render_sidebar():
     """Render the sidebar navigation"""
-    st.sidebar.title("Dealer Nudging System")
-    st.sidebar.markdown("---   ")
+    st.sidebar.title("DNS Navigation")
     
-    # Navigation buttons
-    if st.sidebar.button("Dashboard", key="nav_dashboard"):
-        navigate_to("dashboard")
-    if st.sidebar.button("View Schemes", key="nav_schemes"):
-        navigate_to("schemes")
-    if st.sidebar.button("Upload New Scheme", key="nav_upload"):
-        navigate_to("upload")
-    if st.sidebar.button("Scheme Approvals", key="nav_approvals"):
-        navigate_to("approvals")
-    if st.sidebar.button("Simulate Sales", key="nav_simulate"):
-        navigate_to("simulate")
+    # Main navigation
+    if st.sidebar.button("📊 Dashboard", key="nav_dashboard"):
+        st.session_state.page = 'dashboard'
     
+    if st.sidebar.button("🔍 Scheme Explorer", key="nav_schemes"):
+        st.session_state.page = 'schemes'
+    
+    if st.sidebar.button("📱 Products", key="nav_products"):
+        st.session_state.page = 'products'
+    
+    if st.sidebar.button("🏪 Dealers", key="nav_dealers"):
+        st.session_state.page = 'dealers'
+    
+    if st.sidebar.button("💰 Sales Simulation", key="nav_simulation"):
+        st.session_state.page = 'simulation'
+    
+    if st.sidebar.button("📤 Upload Scheme", key="nav_upload"):
+        st.session_state.page = 'upload'
+    
+    # Approval section
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### About")
-    st.sidebar.info(
-        "Dealer Nudging System (DNS) helps dealers track and optimize incentives "
-        "from OEM schemes. Upload scheme PDFs, simulate sales, and get insights."
-    )
+    st.sidebar.subheader("Approvals")
+    
+    # Check for pending approvals
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM scheme_approvals WHERE approval_status = 'Pending'")
+    pending_count = cursor.fetchone()[0]
+    conn.close()
+    
+    if pending_count > 0:
+        if st.sidebar.button(f"⏳ Pending Approvals ({pending_count})", key="nav_approvals"):
+            st.session_state.page = 'approvals'
+    else:
+        st.sidebar.markdown("No pending approvals")
+    
+    # Settings and help
+    st.sidebar.markdown("---")
+    if st.sidebar.button("⚙️ Settings", key="nav_settings"):
+        st.session_state.page = 'settings'
+    
+    if st.sidebar.button("❓ Help", key="nav_help"):
+        st.session_state.page = 'help'
+    
+    # Display current date
+    st.sidebar.markdown("---")
+    current_date = datetime.datetime.now().strftime("%B %d, %Y")
+    st.sidebar.markdown(f"**Current Date:** {current_date}")
 
-# Dashboard page
+# Dashboard
 def render_dashboard():
-    """Render the dashboard page"""
+    """Render the main dashboard"""
     st.markdown("<h1 class='main-header'>Dealer Nudging System Dashboard</h1>", unsafe_allow_html=True)
     
-    # Summary metrics
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
+    
+    # Get summary metrics
+    cursor.execute("SELECT COUNT(*) FROM schemes WHERE deal_status = 'Active'")
+    active_schemes = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM products WHERE is_active = 1")
+    active_products = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM dealers WHERE is_active = 1")
+    active_dealers = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM sales_transactions")
+    total_sales = cursor.fetchone()[0]
+    
+    # Display metrics in a row
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Active Schemes", len(get_active_schemes()))
-    with col2:
-        st.metric("Products", len(get_all_products()))
-    with col3:
-        st.metric("Dealers", len(get_all_dealers()))
-    with col4:
-        pending_count = len(get_pending_approvals())
-        st.metric("Pending Approvals", pending_count)
-    
-    # Sales data visualization
-    st.markdown("<h2 class='sub-header'>Sales Performance</h2>", unsafe_allow_html=True)
-    
-    sales_data = get_sales_data(days=30)
-    if sales_data:
-        try:
-            # Convert to DataFrame for easier manipulation
-            df = pd.DataFrame(sales_data)
-            
-            # Check if required columns exist
-            required_columns = ['product_category', 'quantity_sold', 'earned_dealer_incentive_amount', 
-                               'region', 'sale_timestamp', 'scheme_name']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            
-            if missing_columns:
-                st.warning(f"Some required data columns are missing: {', '.join(missing_columns)}. "
-                          "Please ensure your sales data is complete.")
-                st.info("Try simulating some sales to populate the dashboard with data.")
-                return
-            
-            if len(df) == 0:
-                st.info("No sales data available for the selected period. Try simulating some sales first.")
-                return
-            
-            # Sales by product category
-            st.markdown("<h3>Sales by Product Category</h3>", unsafe_allow_html=True)
-            category_sales = df.groupby('product_category').agg({
-                'quantity_sold': 'sum',
-                'earned_dealer_incentive_amount': 'sum'
-            }).reset_index()
-            
-            fig1 = px.bar(
-                category_sales, 
-                x='product_category', 
-                y='quantity_sold',
-                color='earned_dealer_incentive_amount',
-                labels={
-                    'product_category': 'Product Category',
-                    'quantity_sold': 'Units Sold',
-                    'earned_dealer_incentive_amount': 'Incentive Amount'
-                },
-                title='Sales and Incentives by Product Category'
-            )
-            st.plotly_chart(fig1, use_container_width=True, key="plot_category_sales")
-            
-            # Sales by region
-            st.markdown("<h3>Sales by Region</h3>", unsafe_allow_html=True)
-            region_sales = df.groupby('region').agg({
-                'quantity_sold': 'sum',
-                'earned_dealer_incentive_amount': 'sum'
-            }).reset_index()
-            
-            fig2 = px.pie(
-                region_sales, 
-                values='quantity_sold', 
-                names='region',
-                title='Sales Distribution by Region'
-            )
-            st.plotly_chart(fig2, use_container_width=True, key="plot_region_sales")
-            
-            # Sales trend
-            st.markdown("<h3>Sales Trend</h3>", unsafe_allow_html=True)
-            df['sale_date'] = pd.to_datetime(df['sale_timestamp']).dt.date
-            daily_sales = df.groupby('sale_date').agg({
-                'quantity_sold': 'sum',
-                'earned_dealer_incentive_amount': 'sum'
-            }).reset_index()
-            
-            fig3 = px.line(
-                daily_sales, 
-                x='sale_date', 
-                y=['quantity_sold', 'earned_dealer_incentive_amount'],
-                labels={
-                    'sale_date': 'Date',
-                    'value': 'Value',
-                    'variable': 'Metric'
-                },
-                title='Daily Sales and Incentives'
-            )
-            st.plotly_chart(fig3, use_container_width=True, key="plot_sales_trend")
-            
-            # Scheme effectiveness
-            st.markdown("<h3>Scheme Effectiveness</h3>", unsafe_allow_html=True)
-            scheme_effectiveness = df.groupby('scheme_name').agg({
-                'quantity_sold': 'sum',
-                'earned_dealer_incentive_amount': 'sum'
-            }).reset_index()
-            
-            # Avoid division by zero
-            scheme_effectiveness['incentive_per_unit'] = scheme_effectiveness.apply(
-                lambda x: x['earned_dealer_incentive_amount'] / x['quantity_sold'] 
-                if x['quantity_sold'] > 0 else 0, axis=1
-            )
-            
-            fig4 = px.bar(
-                scheme_effectiveness, 
-                x='scheme_name', 
-                y='incentive_per_unit',
-                color='quantity_sold',
-                labels={
-                    'scheme_name': 'Scheme',
-                    'incentive_per_unit': 'Incentive per Unit',
-                    'quantity_sold': 'Units Sold'
-                },
-                title='Scheme Effectiveness (Incentive per Unit)'
-            )
-            st.plotly_chart(fig4, use_container_width=True, key="plot_scheme_effectiveness")
-        
-        except Exception as e:
-            st.error(f"Error rendering dashboard visualizations: {str(e)}")
-            st.info("This could be due to incomplete or malformed sales data. Try simulating some sales first.")
-    else:
-        st.info("No sales data available for visualization. Try simulating some sales first.")
-        
-        # Show sample visualization with dummy data
-        st.markdown("<h3>Sample Visualization (Demo Data)</h3>", unsafe_allow_html=True)
-        
-        # Sample product category data
-        sample_categories = pd.DataFrame({
-            'product_category': ['Smartphones', 'Tablets', 'Wearables', 'Accessories'],
-            'quantity_sold': [120, 45, 78, 210],
-            'earned_dealer_incentive_amount': [24000, 13500, 7800, 6300]
-        })
-        
-        fig_sample = px.bar(
-            sample_categories,
-            x='product_category',
-            y='quantity_sold',
-            color='earned_dealer_incentive_amount',
-            labels={
-                'product_category': 'Product Category',
-                'quantity_sold': 'Units Sold (Sample)',
-                'earned_dealer_incentive_amount': 'Incentive Amount (Sample)'
-            },
-            title='Sample Sales Visualization (Demo Data)'
-        )
-        st.plotly_chart(fig_sample, use_container_width=True, key="plot_sample")
-
-# Schemes page
-def render_schemes():
-    """Render the schemes page"""
-    st.markdown("<h1 class='main-header'>Available Schemes</h1>", unsafe_allow_html=True)
-    
-    # Filter options
-    st.markdown("<h2 class='sub-header'>Filter Schemes</h2>", unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Get unique regions from schemes
-        regions = ["All"]
-        for scheme in get_active_schemes():
-            if "applicable_region" in scheme.keys():
-                region = scheme["applicable_region"]
-                if region and region not in regions:
-                    regions.append(region)
-        
-        filter_region = st.selectbox(
-            "Region",
-            regions,
-            key="filter_region"
-        )
-    
-    with col2:
-        # Get unique scheme types
-        scheme_types = ["All"]
-        for scheme in get_active_schemes():
-            if "scheme_type" in scheme.keys():
-                scheme_type = scheme["scheme_type"]
-                if scheme_type and scheme_type not in scheme_types:
-                    scheme_types.append(scheme_type)
-        
-        filter_type = st.selectbox(
-            "Scheme Type",
-            scheme_types,
-            key="filter_type"
-        )
-    
-    # Apply filters
-    filtered_schemes = get_active_schemes()
-    if filter_region != "All":
-        filtered_schemes = [s for s in filtered_schemes if "applicable_region" in s.keys() and s["applicable_region"] == filter_region]
-    if filter_type != "All":
-        filtered_schemes = [s for s in filtered_schemes if "scheme_type" in s.keys() and s["scheme_type"] == filter_type]
-    
-    # Display schemes as cards
-    for scheme in filtered_schemes:
-        st.markdown("<div class=\"card\">", unsafe_allow_html=True)
-        
-        # Safely access scheme attributes
-        scheme_name = scheme["scheme_name"] if "scheme_name" in scheme.keys() else "Unnamed Scheme"
-        scheme_type = scheme["scheme_type"] if "scheme_type" in scheme.keys() else "Unknown Type"
-        period_start = scheme["scheme_period_start"] if "scheme_period_start" in scheme.keys() else "Unknown"
-        period_end = scheme["scheme_period_end"] if "scheme_period_end" in scheme.keys() else "Unknown"
-        region = scheme["applicable_region"] if "applicable_region" in scheme.keys() else "Unknown"
-        eligibility = scheme["dealer_type_eligibility"] if "dealer_type_eligibility" in scheme.keys() else "Unknown"
-        
-        st.markdown(f"### {scheme_name}")
-        st.markdown(f"**Type:** {scheme_type}")
-        st.markdown(f"**Period:** {period_start} to {period_end}")
-        st.markdown(f"**Region:** {region}")
-        st.markdown(f"**Dealer Eligibility:** {eligibility}")
-        
-        if st.button("View Details", key=f"view_scheme_{scheme['scheme_id']}"):
-            st.session_state.current_scheme = scheme["scheme_id"]
-            navigate_to("scheme_details")
-        
+        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='metric-value'>{active_schemes}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='metric-label'>Active Schemes</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
     
-    if not filtered_schemes:
-        st.info("No schemes match the selected filters. Try adjusting your filter criteria or upload new schemes.")
-
-# Scheme details page
-def render_scheme_details():
-    """Render the scheme details page"""
-    scheme_id = st.session_state.current_scheme
-    scheme = get_scheme_details(scheme_id)
+    with col2:
+        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='metric-value'>{active_products}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='metric-label'>Active Products</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     
-    if not scheme:
-        st.error("Scheme not found.")
+    with col3:
+        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='metric-value'>{active_dealers}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='metric-label'>Active Dealers</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    with col4:
+        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='metric-value'>{total_sales}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='metric-label'>Total Sales</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Scheme effectiveness analysis
+    st.markdown("<h2 class='sub-header'>Scheme Effectiveness Analysis</h2>", unsafe_allow_html=True)
+    
+    try:
+        # Get scheme performance data
+        cursor.execute("""
+        SELECT s.scheme_name, COUNT(st.sale_id) as sales_count, SUM(st.earned_dealer_incentive_amount) as total_incentive
+        FROM schemes s
+        LEFT JOIN sales_transactions st ON s.scheme_id = st.scheme_id
+        WHERE s.deal_status = 'Active'
+        GROUP BY s.scheme_id
+        ORDER BY total_incentive DESC
+        LIMIT 10
+        """)
+        
+        scheme_performance = cursor.fetchall()
+        
+        if scheme_performance and len(scheme_performance) > 0:
+            # Convert to DataFrame
+            scheme_df = pd.DataFrame(scheme_performance, columns=['Scheme', 'Sales Count', 'Total Incentive'])
+            scheme_df = scheme_df.fillna(0)  # Replace NaN with 0
+            
+            # Create bar chart
+            fig = px.bar(
+                scheme_df,
+                x='Scheme',
+                y='Total Incentive',
+                color='Sales Count',
+                labels={'Total Incentive': 'Total Incentive Amount (₹)', 'Scheme': 'Scheme Name'},
+                title='Top Performing Schemes by Incentive Amount',
+                color_continuous_scale=px.colors.sequential.Blues
+            )
+            
+            fig.update_layout(
+                xaxis_tickangle=-45,
+                height=500,
+                margin=dict(l=20, r=20, t=40, b=100)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True, key="scheme_performance_chart")
+        else:
+            st.info("No scheme performance data available yet. Start recording sales to see this chart.")
+    except Exception as e:
+        st.error(f"Error generating scheme effectiveness chart: {str(e)}")
+    
+    # Product performance heatmap
+    st.markdown("<h2 class='sub-header'>Product Performance Heatmap</h2>", unsafe_allow_html=True)
+    
+    try:
+        # Get product performance by scheme
+        cursor.execute("""
+        SELECT p.product_name, s.scheme_name, COUNT(st.sale_id) as sales_count
+        FROM products p
+        JOIN sales_transactions st ON p.product_id = st.product_id
+        JOIN schemes s ON st.scheme_id = s.scheme_id
+        WHERE p.is_active = 1 AND s.deal_status = 'Active'
+        GROUP BY p.product_id, s.scheme_id
+        ORDER BY sales_count DESC
+        LIMIT 50
+        """)
+        
+        product_scheme_performance = cursor.fetchall()
+        
+        if product_scheme_performance and len(product_scheme_performance) > 0:
+            # Convert to DataFrame
+            product_scheme_df = pd.DataFrame(product_scheme_performance, columns=['Product', 'Scheme', 'Sales Count'])
+            
+            # Create pivot table for heatmap
+            pivot_df = product_scheme_df.pivot_table(
+                values='Sales Count',
+                index='Product',
+                columns='Scheme',
+                fill_value=0
+            )
+            
+            # Create heatmap
+            fig = px.imshow(
+                pivot_df,
+                labels=dict(x="Scheme", y="Product", color="Sales Count"),
+                x=pivot_df.columns,
+                y=pivot_df.index,
+                color_continuous_scale='Blues',
+                title='Product Performance by Scheme'
+            )
+            
+            fig.update_layout(
+                height=600,
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True, key="product_heatmap_chart")
+        else:
+            st.info("No product performance data available yet. Start recording sales to see this heatmap.")
+    except Exception as e:
+        st.error(f"Error generating product performance heatmap: {str(e)}")
+    
+    # Regional performance
+    st.markdown("<h2 class='sub-header'>Regional Performance</h2>", unsafe_allow_html=True)
+    
+    try:
+        # Get regional performance data
+        cursor.execute("""
+        SELECT d.region, COUNT(st.sale_id) as sales_count, SUM(st.earned_dealer_incentive_amount) as total_incentive
+        FROM dealers d
+        JOIN sales_transactions st ON d.dealer_id = st.dealer_id
+        GROUP BY d.region
+        ORDER BY total_incentive DESC
+        """)
+        
+        regional_performance = cursor.fetchall()
+        
+        if regional_performance and len(regional_performance) > 0:
+            # Convert to DataFrame
+            region_df = pd.DataFrame(regional_performance, columns=['Region', 'Sales Count', 'Total Incentive'])
+            region_df = region_df.fillna(0)  # Replace NaN with 0
+            
+            # Create pie chart
+            fig = px.pie(
+                region_df,
+                values='Total Incentive',
+                names='Region',
+                title='Incentive Distribution by Region',
+                color_discrete_sequence=px.colors.sequential.Blues_r
+            )
+            
+            fig.update_layout(
+                height=500,
+                margin=dict(l=20, r=20, t=40, b=20)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True, key="regional_performance_chart")
+        else:
+            st.info("No regional performance data available yet. Start recording sales to see this chart.")
+    except Exception as e:
+        st.error(f"Error generating regional performance chart: {str(e)}")
+    
+    # Recent activity
+    st.markdown("<h2 class='sub-header'>Recent Activity</h2>", unsafe_allow_html=True)
+    
+    try:
+        # Get recent sales transactions
+        cursor.execute("""
+        SELECT st.sale_id, d.dealer_name, p.product_name, s.scheme_name, 
+               st.quantity_sold, st.earned_dealer_incentive_amount, st.sale_timestamp
+        FROM sales_transactions st
+        JOIN dealers d ON st.dealer_id = d.dealer_id
+        JOIN products p ON st.product_id = p.product_id
+        JOIN schemes s ON st.scheme_id = s.scheme_id
+        ORDER BY st.sale_timestamp DESC
+        LIMIT 10
+        """)
+        
+        recent_sales = cursor.fetchall()
+        
+        if recent_sales and len(recent_sales) > 0:
+            # Convert to DataFrame
+            sales_df = pd.DataFrame(recent_sales, columns=[
+                'Sale ID', 'Dealer', 'Product', 'Scheme', 
+                'Quantity', 'Incentive Amount', 'Timestamp'
+            ])
+            
+            # Format timestamp
+            sales_df['Timestamp'] = pd.to_datetime(sales_df['Timestamp']).dt.strftime('%Y-%m-%d %H:%M')
+            
+            # Display as table
+            st.markdown("<div class='table-container'>", unsafe_allow_html=True)
+            st.table(sales_df)
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.info("No recent sales activity available yet.")
+    except Exception as e:
+        st.error(f"Error retrieving recent activity: {str(e)}")
+    
+    conn.close()
+
+# Scheme Explorer
+def render_schemes():
+    """Render the scheme explorer page"""
+    st.markdown("<h1 class='main-header'>Scheme Explorer</h1>", unsafe_allow_html=True)
+    
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
+    
+    # Filters
+    st.markdown("<h2 class='sub-header'>Filters</h2>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Get scheme types
+        cursor.execute("SELECT DISTINCT scheme_type FROM schemes WHERE scheme_type IS NOT NULL")
+        scheme_types = [row[0] for row in cursor.fetchall()]
+        scheme_types = ['All'] + scheme_types
+        
+        selected_type = st.selectbox("Scheme Type", scheme_types, key="scheme_type_filter")
+    
+    with col2:
+        # Get regions
+        cursor.execute("SELECT DISTINCT applicable_region FROM schemes WHERE applicable_region IS NOT NULL")
+        regions = [row[0] for row in cursor.fetchall()]
+        regions = ['All'] + regions
+        
+        selected_region = st.selectbox("Region", regions, key="scheme_region_filter")
+    
+    with col3:
+        # Status filter
+        status_options = ['All', 'Active', 'Inactive']
+        selected_status = st.selectbox("Status", status_options, key="scheme_status_filter")
+    
+    # Build query based on filters
+    query = "SELECT * FROM schemes WHERE 1=1"
+    params = []
+    
+    if selected_type != 'All':
+        query += " AND scheme_type = ?"
+        params.append(selected_type)
+    
+    if selected_region != 'All':
+        query += " AND applicable_region = ?"
+        params.append(selected_region)
+    
+    if selected_status != 'All':
+        query += " AND deal_status = ?"
+        params.append(selected_status)
+    
+    query += " ORDER BY upload_timestamp DESC"
+    
+    # Execute query
+    cursor.execute(query, params)
+    schemes = cursor.fetchall()
+    
+    # Display schemes
+    st.markdown("<h2 class='sub-header'>Schemes</h2>", unsafe_allow_html=True)
+    
+    if schemes and len(schemes) > 0:
+        for scheme in schemes:
+            # Determine card class based on approval status
+            card_class = "scheme-card"
+            if scheme['approval_status'] == 'Pending':
+                card_class += " approval-pending"
+            elif scheme['approval_status'] == 'Approved':
+                card_class += " approval-approved"
+            elif scheme['approval_status'] == 'Rejected':
+                card_class += " approval-rejected"
+            
+            st.markdown(f"<div class='{card_class}'>", unsafe_allow_html=True)
+            
+            # Scheme header
+            col1, col2, col3 = st.columns([3, 1, 1])
+            
+            with col1:
+                st.markdown(f"### {scheme['scheme_name']}")
+            
+            with col2:
+                st.markdown(f"**Type:** {scheme['scheme_type'] or 'N/A'}")
+            
+            with col3:
+                st.markdown(f"**Status:** {scheme['deal_status']}")
+            
+            # Scheme details
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown(f"**Period:** {scheme['scheme_period_start']} to {scheme['scheme_period_end']}")
+                st.markdown(f"**Region:** {scheme['applicable_region'] or 'All Regions'}")
+            
+            with col2:
+                st.markdown(f"**Dealer Eligibility:** {scheme['dealer_type_eligibility'] or 'All Dealers'}")
+                st.markdown(f"**Approval Status:** {scheme['approval_status']}")
+            
+            # Get products for this scheme
+            cursor.execute("""
+            SELECT p.product_name, sp.support_type, sp.payout_type, sp.payout_amount, sp.payout_unit, sp.free_item_description
+            FROM scheme_products sp
+            JOIN products p ON sp.product_id = p.product_id
+            WHERE sp.scheme_id = ?
+            """, (scheme['scheme_id'],))
+            
+            products = cursor.fetchall()
+            
+            if products and len(products) > 0:
+                st.markdown("**Products:**")
+                
+                for product in products:
+                    product_text = f"- {product['product_name']}: {product['support_type'] or 'Support'} - "
+                    
+                    if product['payout_type'] == 'Fixed':
+                        product_text += f"₹{product['payout_amount']} {product['payout_unit'] or ''}"
+                    elif product['payout_type'] == 'Percentage':
+                        product_text += f"{product['payout_amount']}% {product['payout_unit'] or ''}"
+                    else:
+                        product_text += f"{product['payout_amount']} {product['payout_unit'] or ''}"
+                    
+                    # Add free item if available
+                    if product['free_item_description']:
+                        product_text += f" + <span class='highlight'>Free: {product['free_item_description']}</span>"
+                    
+                    st.markdown(product_text, unsafe_allow_html=True)
+            
+            # Actions
+            col1, col2, col3 = st.columns([1, 1, 2])
+            
+            with col1:
+                if st.button("View Details", key=f"view_{scheme['scheme_id']}"):
+                    st.session_state.selected_scheme_id = scheme['scheme_id']
+                    st.session_state.page = 'scheme_details'
+            
+            with col2:
+                if st.button("Edit", key=f"edit_{scheme['scheme_id']}"):
+                    st.session_state.edit_mode = True
+                    st.session_state.edited_scheme = dict(scheme)
+                    
+                    # Get products for editing
+                    cursor.execute("""
+                    SELECT sp.*, p.product_name
+                    FROM scheme_products sp
+                    JOIN products p ON sp.product_id = p.product_id
+                    WHERE sp.scheme_id = ?
+                    """, (scheme['scheme_id'],))
+                    
+                    st.session_state.edited_products = [dict(p) for p in cursor.fetchall()]
+                    st.session_state.page = 'edit_scheme'
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.info("No schemes found matching the selected filters.")
+    
+    conn.close()
+
+# Scheme Details
+def render_scheme_details():
+    """Render detailed view of a selected scheme"""
+    if not st.session_state.selected_scheme_id:
+        st.error("No scheme selected. Please select a scheme from the Scheme Explorer.")
+        if st.button("Back to Scheme Explorer"):
+            st.session_state.page = 'schemes'
         return
     
-    # Safely access scheme attributes
-    scheme_name = scheme["scheme_name"] if "scheme_name" in scheme.keys() else "Unnamed Scheme"
-    scheme_type = scheme["scheme_type"] if "scheme_type" in scheme.keys() else "Unknown Type"
-    period_start = scheme["scheme_period_start"] if "scheme_period_start" in scheme.keys() else "Unknown"
-    period_end = scheme["scheme_period_end"] if "scheme_period_end" in scheme.keys() else "Unknown"
-    region = scheme["applicable_region"] if "applicable_region" in scheme.keys() else "Unknown"
-    eligibility = scheme["dealer_type_eligibility"] if "dealer_type_eligibility" in scheme.keys() else "Unknown"
-    deal_status = scheme["deal_status"] if "deal_status" in scheme.keys() else "Unknown"
-    approval_status = scheme["approval_status"] if "approval_status" in scheme.keys() else "Unknown"
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
     
-    st.markdown(f"<h1 class='main-header'>{scheme_name}</h1>", unsafe_allow_html=True)
+    # Get scheme details
+    cursor.execute("SELECT * FROM schemes WHERE scheme_id = ?", (st.session_state.selected_scheme_id,))
+    scheme = cursor.fetchone()
+    
+    if not scheme:
+        st.error("Scheme not found. It may have been deleted.")
+        if st.button("Back to Scheme Explorer"):
+            st.session_state.page = 'schemes'
+        conn.close()
+        return
+    
+    # Display scheme header
+    st.markdown(f"<h1 class='main-header'>{scheme['scheme_name']}</h1>", unsafe_allow_html=True)
+    
+    # Back button
+    if st.button("← Back to Scheme Explorer"):
+        st.session_state.page = 'schemes'
     
     # Scheme details
     st.markdown("<h2 class='sub-header'>Scheme Details</h2>", unsafe_allow_html=True)
+    
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown(f"**Type:** {scheme_type}")
-        st.markdown(f"**Period:** {period_start} to {period_end}")
-        st.markdown(f"**Region:** {region}")
-    
-    with col2:
-        st.markdown(f"**Dealer Eligibility:** {eligibility}")
-        st.markdown(f"**Status:** {deal_status}")
-        st.markdown(f"**Approval Status:** {approval_status}")
-    
-    # Products in scheme
-    st.markdown("<h2 class='sub-header'>Products</h2>", unsafe_allow_html=True)
-    products = get_scheme_products(scheme_id)
-    
-    for product in products:
-        st.markdown("<div class=\"card\">", unsafe_allow_html=True)
-        
-        # Safely access product attributes
-        product_name = product["product_name"] if "product_name" in product.keys() else "Unnamed Product"
-        product_code = product["product_code"] if "product_code" in product.keys() else "Unknown Code"
-        product_category = product["product_category"] if "product_category" in product.keys() else "Unknown Category"
-        support_type = product["support_type"] if "support_type" in product.keys() else "Unknown Support"
-        payout_type = product["payout_type"] if "payout_type" in product.keys() else "Unknown Payout Type"
-        payout_amount = product["payout_amount"] if "payout_amount" in product.keys() else 0
-        payout_unit = product["payout_unit"] if "payout_unit" in product.keys() else "INR"
-        
-        st.markdown(f"### {product_name} ({product_code})")
-        st.markdown(f"**Category:** {product_category}")
-        st.markdown(f"**Support Type:** {support_type}")
-        st.markdown(f"**Payout:** {payout_amount} {payout_unit} ({payout_type})")
-        
-        # Display free item if available
-        free_item = product["free_item_description"] if "free_item_description" in product.keys() else None
-        if free_item:
-            st.markdown(f"<div class='free-item-highlight'>🎁 FREE: {free_item}</div>", unsafe_allow_html=True)
-        
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown(f"**Scheme Type:** {scheme['scheme_type'] or 'N/A'}")
+        st.markdown(f"**Period:** {scheme['scheme_period_start']} to {scheme['scheme_period_end']}")
+        st.markdown(f"**Region:** {scheme['applicable_region'] or 'All Regions'}")
+        st.markdown(f"**Dealer Eligibility:** {scheme['dealer_type_eligibility'] or 'All Dealers'}")
         st.markdown("</div>", unsafe_allow_html=True)
     
-    # Scheme rules
-    st.markdown("<h2 class='sub-header'>Rules</h2>", unsafe_allow_html=True)
-    rules = get_scheme_rules(scheme_id)
+    with col2:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown(f"**Status:** {scheme['deal_status']}")
+        st.markdown(f"**Approval Status:** {scheme['approval_status']}")
+        st.markdown(f"**Approved By:** {scheme['approved_by'] or 'N/A'}")
+        st.markdown(f"**Upload Date:** {scheme['upload_timestamp']}")
+        st.markdown("</div>", unsafe_allow_html=True)
     
-    for rule in rules:
-        # Safely access rule attributes
-        rule_type = rule["rule_type"] if "rule_type" in rule.keys() else "General"
-        rule_description = rule["rule_description"] if "rule_description" in rule.keys() else "No description"
+    # Get products for this scheme
+    cursor.execute("""
+    SELECT sp.*, p.product_name, p.product_category, p.ram, p.storage, p.color
+    FROM scheme_products sp
+    JOIN products p ON sp.product_id = p.product_id
+    WHERE sp.scheme_id = ?
+    """, (scheme['scheme_id'],))
+    
+    products = cursor.fetchall()
+    
+    # Display products
+    st.markdown("<h2 class='sub-header'>Products</h2>", unsafe_allow_html=True)
+    
+    if products and len(products) > 0:
+        for product in products:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown(f"**Product:** {product['product_name']}")
+                st.markdown(f"**Category:** {product['product_category'] or 'N/A'}")
+                st.markdown(f"**Specifications:** {product['ram'] or 'N/A'} RAM, {product['storage'] or 'N/A'} Storage, {product['color'] or 'N/A'}")
+            
+            with col2:
+                st.markdown(f"**Support Type:** {product['support_type'] or 'N/A'}")
+                
+                if product['payout_type'] == 'Fixed':
+                    st.markdown(f"**Payout:** ₹{product['payout_amount']} {product['payout_unit'] or ''}")
+                elif product['payout_type'] == 'Percentage':
+                    st.markdown(f"**Payout:** {product['payout_amount']}% {product['payout_unit'] or ''}")
+                else:
+                    st.markdown(f"**Payout:** {product['payout_amount']} {product['payout_unit'] or ''}")
+                
+                st.markdown(f"**Dealer Contribution:** ₹{product['dealer_contribution']}")
+                st.markdown(f"**Total Payout:** ₹{product['total_payout']}")
+            
+            # Display free item if available
+            if product['free_item_description']:
+                st.markdown("<div class='free-item-alert'>", unsafe_allow_html=True)
+                st.markdown(f"**🎁 Free Item:** {product['free_item_description']}")
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Display bundle offer details
+            if product['is_bundle_offer'] == 1:
+                st.markdown("<div class='highlight'>", unsafe_allow_html=True)
+                st.markdown(f"**Bundle Offer:** Yes (Bundle Price: ₹{product['bundle_price']})")
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Display upgrade offer details
+            if product['is_upgrade_offer'] == 1:
+                st.markdown("<div class='highlight'>", unsafe_allow_html=True)
+                st.markdown("**Upgrade Offer:** Yes")
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.info("No products associated with this scheme.")
+    
+    # Get scheme rules
+    cursor.execute("SELECT * FROM scheme_rules WHERE scheme_id = ?", (scheme['scheme_id'],))
+    rules = cursor.fetchall()
+    
+    # Display rules
+    if rules and len(rules) > 0:
+        st.markdown("<h2 class='sub-header'>Scheme Rules</h2>", unsafe_allow_html=True)
         
-        st.markdown(f"**{rule_type}:** {rule_description}")
+        for rule in rules:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown(f"**Rule Type:** {rule['rule_type']}")
+            st.markdown(f"**Description:** {rule['rule_description']}")
+            st.markdown(f"**Value:** {rule['rule_value']}")
+            st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Get scheme parameters
+    cursor.execute("SELECT * FROM scheme_parameters WHERE scheme_id = ?", (scheme['scheme_id'],))
+    parameters = cursor.fetchall()
+    
+    # Display parameters
+    if parameters and len(parameters) > 0:
+        st.markdown("<h2 class='sub-header'>Scheme Parameters</h2>", unsafe_allow_html=True)
+        
+        for param in parameters:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown(f"**Parameter:** {param['parameter_name']}")
+            st.markdown(f"**Description:** {param['parameter_description']}")
+            st.markdown(f"**Criteria:** {param['parameter_criteria']}")
+            st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Get sales performance for this scheme
+    cursor.execute("""
+    SELECT p.product_name, COUNT(st.sale_id) as sales_count, SUM(st.earned_dealer_incentive_amount) as total_incentive
+    FROM sales_transactions st
+    JOIN products p ON st.product_id = p.product_id
+    WHERE st.scheme_id = ?
+    GROUP BY p.product_id
+    ORDER BY total_incentive DESC
+    """, (scheme['scheme_id'],))
+    
+    performance = cursor.fetchall()
+    
+    # Display performance
+    if performance and len(performance) > 0:
+        st.markdown("<h2 class='sub-header'>Performance</h2>", unsafe_allow_html=True)
+        
+        # Convert to DataFrame
+        perf_df = pd.DataFrame(performance, columns=['Product', 'Sales Count', 'Total Incentive'])
+        
+        # Create bar chart
+        fig = px.bar(
+            perf_df,
+            x='Product',
+            y='Total Incentive',
+            color='Sales Count',
+            labels={'Total Incentive': 'Total Incentive Amount (₹)', 'Product': 'Product Name'},
+            title='Product Performance in this Scheme',
+            color_continuous_scale=px.colors.sequential.Blues
+        )
+        
+        fig.update_layout(
+            xaxis_tickangle=-45,
+            height=500,
+            margin=dict(l=20, r=20, t=40, b=100)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True, key="scheme_product_performance")
+    
+    conn.close()
+
+# Edit Scheme
+def render_edit_scheme():
+    """Render the scheme editing page"""
+    if not st.session_state.edit_mode or not st.session_state.edited_scheme:
+        st.error("No scheme selected for editing. Please select a scheme from the Scheme Explorer.")
+        if st.button("Back to Scheme Explorer"):
+            st.session_state.page = 'schemes'
+        return
+    
+    scheme = st.session_state.edited_scheme
+    
+    # Display scheme header
+    st.markdown(f"<h1 class='main-header'>Edit Scheme: {scheme['scheme_name']}</h1>", unsafe_allow_html=True)
     
     # Back button
-    if st.button("Back to Schemes"):
-        navigate_to("schemes")
+    if st.button("← Cancel and Go Back"):
+        st.session_state.edit_mode = False
+        st.session_state.edited_scheme = None
+        st.session_state.edited_products = None
+        st.session_state.page = 'schemes'
+        return
+    
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
+    
+    # Edit form
+    st.markdown("<div class='edit-mode'>", unsafe_allow_html=True)
+    st.markdown("<h2 class='sub-header'>Scheme Details</h2>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        scheme['scheme_name'] = st.text_input("Scheme Name", scheme['scheme_name'])
+        scheme['scheme_type'] = st.text_input("Scheme Type", scheme['scheme_type'] or "")
+        scheme['scheme_period_start'] = st.date_input("Start Date", datetime.datetime.strptime(scheme['scheme_period_start'], "%Y-%m-%d") if scheme['scheme_period_start'] else datetime.datetime.now()).strftime("%Y-%m-%d")
+        scheme['scheme_period_end'] = st.date_input("End Date", datetime.datetime.strptime(scheme['scheme_period_end'], "%Y-%m-%d") if scheme['scheme_period_end'] else (datetime.datetime.now() + datetime.timedelta(days=30))).strftime("%Y-%m-%d")
+    
+    with col2:
+        scheme['applicable_region'] = st.text_input("Applicable Region", scheme['applicable_region'] or "")
+        scheme['dealer_type_eligibility'] = st.text_input("Dealer Eligibility", scheme['dealer_type_eligibility'] or "")
+        scheme['deal_status'] = st.selectbox("Status", ['Active', 'Inactive'], index=0 if scheme['deal_status'] == 'Active' else 1)
+        scheme['notes'] = st.text_area("Notes", scheme['notes'] or "")
+    
+    # Edit products
+    st.markdown("<h2 class='sub-header'>Products</h2>", unsafe_allow_html=True)
+    
+    if st.session_state.edited_products and len(st.session_state.edited_products) > 0:
+        for i, product in enumerate(st.session_state.edited_products):
+            st.markdown(f"<h3>Product: {product['product_name']}</h3>", unsafe_allow_html=True)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                product['support_type'] = st.text_input("Support Type", product['support_type'] or "", key=f"support_type_{i}")
+                product['payout_type'] = st.selectbox("Payout Type", ['Fixed', 'Percentage', 'Other'], index=0 if product['payout_type'] == 'Fixed' else (1 if product['payout_type'] == 'Percentage' else 2), key=f"payout_type_{i}")
+                product['payout_amount'] = st.number_input("Payout Amount", min_value=0.0, value=float(product['payout_amount'] or 0), key=f"payout_amount_{i}")
+                product['payout_unit'] = st.text_input("Payout Unit", product['payout_unit'] or "", key=f"payout_unit_{i}")
+            
+            with col2:
+                product['dealer_contribution'] = st.number_input("Dealer Contribution", min_value=0.0, value=float(product['dealer_contribution'] or 0), key=f"dealer_contribution_{i}")
+                product['total_payout'] = st.number_input("Total Payout", min_value=0.0, value=float(product['total_payout'] or 0), key=f"total_payout_{i}")
+                product['is_bundle_offer'] = 1 if st.checkbox("Bundle Offer", product['is_bundle_offer'] == 1, key=f"is_bundle_{i}") else 0
+                
+                if product['is_bundle_offer'] == 1:
+                    product['bundle_price'] = st.number_input("Bundle Price", min_value=0.0, value=float(product['bundle_price'] or 0), key=f"bundle_price_{i}")
+            
+            # Free item section
+            product['free_item_description'] = st.text_input("Free Item Description (if any)", product['free_item_description'] or "", key=f"free_item_{i}")
+            
+            st.markdown("---")
+    else:
+        st.info("No products associated with this scheme.")
+    
+    # Submit button
+    if st.button("Submit for Approval"):
+        # Update scheme in database
+        try:
+            # First, create an approval request
+            cursor.execute("""
+            INSERT INTO scheme_approvals (scheme_id, requested_by, approval_status, approval_notes)
+            VALUES (?, ?, ?, ?)
+            """, (scheme['scheme_id'], "Current User", "Pending", "Edit request"))
+            
+            # Update scheme with edited values
+            cursor.execute("""
+            UPDATE schemes
+            SET scheme_name = ?, scheme_type = ?, scheme_period_start = ?, scheme_period_end = ?,
+                applicable_region = ?, dealer_type_eligibility = ?, deal_status = ?, notes = ?,
+                approval_status = ?, last_modified = CURRENT_TIMESTAMP
+            WHERE scheme_id = ?
+            """, (
+                scheme['scheme_name'], scheme['scheme_type'], scheme['scheme_period_start'], scheme['scheme_period_end'],
+                scheme['applicable_region'], scheme['dealer_type_eligibility'], scheme['deal_status'], scheme['notes'],
+                "Pending", scheme['scheme_id']
+            ))
+            
+            # Update products
+            if st.session_state.edited_products:
+                for product in st.session_state.edited_products:
+                    cursor.execute("""
+                    UPDATE scheme_products
+                    SET support_type = ?, payout_type = ?, payout_amount = ?, payout_unit = ?,
+                        dealer_contribution = ?, total_payout = ?, is_bundle_offer = ?, bundle_price = ?,
+                        free_item_description = ?, last_modified = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """, (
+                        product['support_type'], product['payout_type'], product['payout_amount'], product['payout_unit'],
+                        product['dealer_contribution'], product['total_payout'], product['is_bundle_offer'], product['bundle_price'],
+                        product['free_item_description'], product['id']
+                    ))
+            
+            conn.commit()
+            st.success("Scheme updated successfully and submitted for approval.")
+            
+            # Reset edit mode
+            st.session_state.edit_mode = False
+            st.session_state.edited_scheme = None
+            st.session_state.edited_products = None
+            
+            # Redirect to schemes page
+            st.session_state.page = 'schemes'
+            st.rerun()
+        
+        except Exception as e:
+            conn.rollback()
+            st.error(f"Error updating scheme: {str(e)}")
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    conn.close()
 
-# Upload page
-def render_upload():
-    """Render the upload page"""
-    st.markdown("<h1 class='main-header'>Upload New Scheme</h1>", unsafe_allow_html=True)
+# Products
+def render_products():
+    """Render the products page"""
+    st.markdown("<h1 class='main-header'>Products</h1>", unsafe_allow_html=True)
     
-    # File upload
-    uploaded_file = st.file_uploader("Upload Scheme PDF", type=["pdf"])
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
     
-    if uploaded_file:
-        st.session_state.uploaded_pdf = save_uploaded_pdf(uploaded_file)
-        st.success(f"File uploaded: {uploaded_file.name}")
+    # Filters
+    st.markdown("<h2 class='sub-header'>Filters</h2>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Get product categories
+        cursor.execute("SELECT DISTINCT product_category FROM products WHERE product_category IS NOT NULL")
+        categories = [row[0] for row in cursor.fetchall()]
+        categories = ['All'] + categories
         
-        # Extract text from PDF
+        selected_category = st.selectbox("Category", categories, key="product_category_filter")
+    
+    with col2:
+        # Get RAM options
+        cursor.execute("SELECT DISTINCT ram FROM products WHERE ram IS NOT NULL")
+        ram_options = [row[0] for row in cursor.fetchall()]
+        ram_options = ['All'] + ram_options
+        
+        selected_ram = st.selectbox("RAM", ram_options, key="product_ram_filter")
+    
+    with col3:
+        # Get storage options
+        cursor.execute("SELECT DISTINCT storage FROM products WHERE storage IS NOT NULL")
+        storage_options = [row[0] for row in cursor.fetchall()]
+        storage_options = ['All'] + storage_options
+        
+        selected_storage = st.selectbox("Storage", storage_options, key="product_storage_filter")
+    
+    # Build query based on filters
+    query = "SELECT * FROM products WHERE is_active = 1"
+    params = []
+    
+    if selected_category != 'All':
+        query += " AND product_category = ?"
+        params.append(selected_category)
+    
+    if selected_ram != 'All':
+        query += " AND ram = ?"
+        params.append(selected_ram)
+    
+    if selected_storage != 'All':
+        query += " AND storage = ?"
+        params.append(selected_storage)
+    
+    query += " ORDER BY product_name"
+    
+    # Execute query
+    cursor.execute(query, params)
+    products = cursor.fetchall()
+    
+    # Display products
+    st.markdown("<h2 class='sub-header'>Products</h2>", unsafe_allow_html=True)
+    
+    if products and len(products) > 0:
+        # Convert to DataFrame
+        product_df = pd.DataFrame([dict(p) for p in products])
+        
+        # Select columns to display
+        display_columns = [
+            'product_name', 'product_code', 'product_category', 'product_subcategory',
+            'ram', 'storage', 'connectivity', 'color', 'dealer_price_dp', 'mrp'
+        ]
+        
+        # Filter columns that exist in the DataFrame
+        display_columns = [col for col in display_columns if col in product_df.columns]
+        
+        # Rename columns for display
+        rename_map = {
+            'product_name': 'Product Name',
+            'product_code': 'Product Code',
+            'product_category': 'Category',
+            'product_subcategory': 'Subcategory',
+            'ram': 'RAM',
+            'storage': 'Storage',
+            'connectivity': 'Connectivity',
+            'color': 'Color',
+            'dealer_price_dp': 'Dealer Price',
+            'mrp': 'MRP'
+        }
+        
+        # Create display DataFrame
+        display_df = product_df[display_columns].rename(columns=rename_map)
+        
+        # Display as table
+        st.markdown("<div class='table-container'>", unsafe_allow_html=True)
+        st.dataframe(display_df, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Product performance visualization
+        st.markdown("<h2 class='sub-header'>Product Performance</h2>", unsafe_allow_html=True)
+        
+        try:
+            # Get product sales data
+            cursor.execute("""
+            SELECT p.product_name, COUNT(st.sale_id) as sales_count, SUM(st.earned_dealer_incentive_amount) as total_incentive
+            FROM products p
+            LEFT JOIN sales_transactions st ON p.product_id = st.product_id
+            WHERE p.is_active = 1
+            GROUP BY p.product_id
+            ORDER BY total_incentive DESC
+            LIMIT 15
+            """)
+            
+            product_performance = cursor.fetchall()
+            
+            if product_performance and len(product_performance) > 0:
+                # Convert to DataFrame
+                perf_df = pd.DataFrame(product_performance, columns=['Product', 'Sales Count', 'Total Incentive'])
+                perf_df = perf_df.fillna(0)  # Replace NaN with 0
+                
+                # Create bar chart
+                fig = px.bar(
+                    perf_df,
+                    x='Product',
+                    y='Total Incentive',
+                    color='Sales Count',
+                    labels={'Total Incentive': 'Total Incentive Amount (₹)', 'Product': 'Product Name'},
+                    title='Top Performing Products by Incentive Amount',
+                    color_continuous_scale=px.colors.sequential.Blues
+                )
+                
+                fig.update_layout(
+                    xaxis_tickangle=-45,
+                    height=500,
+                    margin=dict(l=20, r=20, t=40, b=100)
+                )
+                
+                st.plotly_chart(fig, use_container_width=True, key="product_performance_chart")
+            else:
+                st.info("No product performance data available yet.")
+        except Exception as e:
+            st.error(f"Error generating product performance chart: {str(e)}")
+    else:
+        st.info("No products found matching the selected filters.")
+    
+    conn.close()
+
+# Dealers
+def render_dealers():
+    """Render the dealers page"""
+    st.markdown("<h1 class='main-header'>Dealers</h1>", unsafe_allow_html=True)
+    
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
+    
+    # Filters
+    st.markdown("<h2 class='sub-header'>Filters</h2>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # Get dealer types
+        cursor.execute("SELECT DISTINCT dealer_type FROM dealers WHERE dealer_type IS NOT NULL")
+        dealer_types = [row[0] for row in cursor.fetchall()]
+        dealer_types = ['All'] + dealer_types
+        
+        selected_type = st.selectbox("Dealer Type", dealer_types, key="dealer_type_filter")
+    
+    with col2:
+        # Get regions
+        cursor.execute("SELECT DISTINCT region FROM dealers WHERE region IS NOT NULL")
+        regions = [row[0] for row in cursor.fetchall()]
+        regions = ['All'] + regions
+        
+        selected_region = st.selectbox("Region", regions, key="dealer_region_filter")
+    
+    with col3:
+        # Get states
+        cursor.execute("SELECT DISTINCT state FROM dealers WHERE state IS NOT NULL")
+        states = [row[0] for row in cursor.fetchall()]
+        states = ['All'] + states
+        
+        selected_state = st.selectbox("State", states, key="dealer_state_filter")
+    
+    # Build query based on filters
+    query = "SELECT * FROM dealers WHERE is_active = 1"
+    params = []
+    
+    if selected_type != 'All':
+        query += " AND dealer_type = ?"
+        params.append(selected_type)
+    
+    if selected_region != 'All':
+        query += " AND region = ?"
+        params.append(selected_region)
+    
+    if selected_state != 'All':
+        query += " AND state = ?"
+        params.append(selected_state)
+    
+    query += " ORDER BY dealer_name"
+    
+    # Execute query
+    cursor.execute(query, params)
+    dealers = cursor.fetchall()
+    
+    # Display dealers
+    st.markdown("<h2 class='sub-header'>Dealers</h2>", unsafe_allow_html=True)
+    
+    if dealers and len(dealers) > 0:
+        # Convert to DataFrame
+        dealer_df = pd.DataFrame([dict(d) for d in dealers])
+        
+        # Select columns to display
+        display_columns = [
+            'dealer_name', 'dealer_code', 'dealer_type', 'region', 'state', 'city',
+            'contact_person', 'contact_email', 'contact_phone'
+        ]
+        
+        # Filter columns that exist in the DataFrame
+        display_columns = [col for col in display_columns if col in dealer_df.columns]
+        
+        # Rename columns for display
+        rename_map = {
+            'dealer_name': 'Dealer Name',
+            'dealer_code': 'Dealer Code',
+            'dealer_type': 'Type',
+            'region': 'Region',
+            'state': 'State',
+            'city': 'City',
+            'contact_person': 'Contact Person',
+            'contact_email': 'Email',
+            'contact_phone': 'Phone'
+        }
+        
+        # Create display DataFrame
+        display_df = dealer_df[display_columns].rename(columns=rename_map)
+        
+        # Display as table
+        st.markdown("<div class='table-container'>", unsafe_allow_html=True)
+        st.dataframe(display_df, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Dealer performance visualization
+        st.markdown("<h2 class='sub-header'>Dealer Performance</h2>", unsafe_allow_html=True)
+        
+        try:
+            # Get dealer sales data
+            cursor.execute("""
+            SELECT d.dealer_name, COUNT(st.sale_id) as sales_count, SUM(st.earned_dealer_incentive_amount) as total_incentive
+            FROM dealers d
+            LEFT JOIN sales_transactions st ON d.dealer_id = st.dealer_id
+            WHERE d.is_active = 1
+            GROUP BY d.dealer_id
+            ORDER BY total_incentive DESC
+            LIMIT 15
+            """)
+            
+            dealer_performance = cursor.fetchall()
+            
+            if dealer_performance and len(dealer_performance) > 0:
+                # Convert to DataFrame
+                perf_df = pd.DataFrame(dealer_performance, columns=['Dealer', 'Sales Count', 'Total Incentive'])
+                perf_df = perf_df.fillna(0)  # Replace NaN with 0
+                
+                # Create bar chart
+                fig = px.bar(
+                    perf_df,
+                    x='Dealer',
+                    y='Total Incentive',
+                    color='Sales Count',
+                    labels={'Total Incentive': 'Total Incentive Amount (₹)', 'Dealer': 'Dealer Name'},
+                    title='Top Performing Dealers by Incentive Amount',
+                    color_continuous_scale=px.colors.sequential.Blues
+                )
+                
+                fig.update_layout(
+                    xaxis_tickangle=-45,
+                    height=500,
+                    margin=dict(l=20, r=20, t=40, b=100)
+                )
+                
+                st.plotly_chart(fig, use_container_width=True, key="dealer_performance_chart")
+            else:
+                st.info("No dealer performance data available yet.")
+        except Exception as e:
+            st.error(f"Error generating dealer performance chart: {str(e)}")
+    else:
+        st.info("No dealers found matching the selected filters.")
+    
+    conn.close()
+
+# Sales Simulation
+def render_simulate_sales():
+    """Render the sales simulation page"""
+    st.markdown("<h1 class='main-header'>Sales Simulation</h1>", unsafe_allow_html=True)
+    
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
+    
+    # Get active schemes
+    cursor.execute("SELECT scheme_id, scheme_name FROM schemes WHERE deal_status = 'Active' LIMIT 10")
+    schemes = cursor.fetchall()
+    
+    if not schemes or len(schemes) == 0:
+        st.error("No active schemes found. Please add schemes first.")
+        conn.close()
+        return
+    
+    # Get active dealers
+    cursor.execute("SELECT dealer_id, dealer_name FROM dealers WHERE is_active = 1")
+    dealers = cursor.fetchall()
+    
+    if not dealers or len(dealers) == 0:
+        st.error("No active dealers found. Please add dealers first.")
+        conn.close()
+        return
+    
+    # Simulation form
+    st.markdown("<h2 class='sub-header'>Simulation Parameters</h2>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Select scheme
+        scheme_options = {scheme['scheme_id']: scheme['scheme_name'] for scheme in schemes}
+        selected_scheme_id = st.selectbox("Select Scheme", list(scheme_options.keys()), format_func=lambda x: scheme_options[x], key="sim_scheme")
+        
+        # Get products for selected scheme
+        cursor.execute("""
+        SELECT p.product_id, p.product_name, p.dealer_price_dp, sp.payout_amount, sp.payout_type, sp.free_item_description
+        FROM products p
+        JOIN scheme_products sp ON p.product_id = sp.product_id
+        WHERE sp.scheme_id = ? AND p.is_active = 1
+        """, (selected_scheme_id,))
+        
+        products = cursor.fetchall()
+        
+        if not products or len(products) == 0:
+            st.error("No products found for the selected scheme.")
+            conn.close()
+            return
+        
+        # Select product
+        product_options = {product['product_id']: product['product_name'] for product in products}
+        selected_product_id = st.selectbox("Select Product", list(product_options.keys()), format_func=lambda x: product_options[x], key="sim_product")
+        
+        # Get selected product details
+        selected_product = None
+        for product in products:
+            if product['product_id'] == selected_product_id:
+                selected_product = product
+                break
+        
+        # Quantity
+        quantity = st.number_input("Quantity", min_value=1, value=1, key="sim_quantity")
+    
+    with col2:
+        # Select dealer
+        dealer_options = {dealer['dealer_id']: dealer['dealer_name'] for dealer in dealers}
+        selected_dealer_id = st.selectbox("Select Dealer", list(dealer_options.keys()), format_func=lambda x: dealer_options[x], key="sim_dealer")
+        
+        # Sale date
+        sale_date = st.date_input("Sale Date", datetime.datetime.now(), key="sim_date")
+        
+        # IMEI/Serial
+        imei_serial = st.text_input("IMEI/Serial Number (Optional)", key="sim_imei")
+    
+    # Simulate button
+    if st.button("Simulate Sale"):
+        if selected_product is None:
+            st.error("Error: Selected product not found.")
+            conn.close()
+            return
+        
+        try:
+            # Calculate dealer price and incentive
+            # Use safe dictionary access with fallback values
+            try:
+                dealer_price = float(selected_product['dealer_price_dp']) if selected_product['dealer_price_dp'] is not None else 10000.0
+            except (TypeError, KeyError):
+                dealer_price = 10000.0  # Default value
+            
+            try:
+                payout_amount = float(selected_product['payout_amount']) if selected_product['payout_amount'] is not None else 0.0
+            except (TypeError, KeyError):
+                payout_amount = 0.0  # Default value
+            
+            try:
+                payout_type = selected_product['payout_type'] if selected_product['payout_type'] is not None else 'Fixed'
+            except (TypeError, KeyError):
+                payout_type = 'Fixed'  # Default value
+            
+            # Calculate incentive based on payout type
+            if payout_type == 'Percentage':
+                incentive_amount = (dealer_price * payout_amount / 100) * quantity
+            else:  # Fixed or other
+                incentive_amount = payout_amount * quantity
+            
+            # Calculate total dealer price
+            total_dealer_price = dealer_price * quantity
+            
+            # Display results
+            st.markdown("<h2 class='sub-header'>Simulation Results</h2>", unsafe_allow_html=True)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"**Dealer:** {dealer_options[selected_dealer_id]}")
+                st.markdown(f"**Scheme:** {scheme_options[selected_scheme_id]}")
+                st.markdown(f"**Product:** {product_options[selected_product_id]}")
+                st.markdown(f"**Quantity:** {quantity}")
+                st.markdown(f"**Sale Date:** {sale_date}")
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"**Dealer Price:** ₹{dealer_price:,.2f}")
+                st.markdown(f"**Total Dealer Price:** ₹{total_dealer_price:,.2f}")
+                st.markdown(f"**Incentive Type:** {payout_type}")
+                st.markdown(f"**Incentive Amount:** ₹{incentive_amount:,.2f}")
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Check for free items and display customer prompt
+            try:
+                free_item = selected_product['free_item_description'] if selected_product['free_item_description'] is not None else None
+            except (TypeError, KeyError):
+                free_item = None
+            
+            if free_item:
+                st.markdown("<div class='free-item-alert'>", unsafe_allow_html=True)
+                st.markdown("### 🎁 Free Item Included!")
+                st.markdown(f"**Free Item:** {free_item}")
+                
+                # Customer prompt section
+                st.markdown("### 📣 Suggested Customer Prompt")
+                st.markdown(f"""
+                *"I'd like to inform you that with your purchase of {product_options[selected_product_id]}, 
+                you'll receive a {free_item} absolutely free! This is part of our special 
+                {scheme_options[selected_scheme_id]} promotion running right now."*
+                """)
+                st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Record sale button
+            if st.button("Record This Sale"):
+                try:
+                    # Insert into sales_transactions
+                    cursor.execute("""
+                    INSERT INTO sales_transactions (
+                        dealer_id, scheme_id, product_id, quantity_sold, dealer_price_dp,
+                        earned_dealer_incentive_amount, imei_serial, sale_timestamp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        selected_dealer_id, selected_scheme_id, selected_product_id, quantity,
+                        dealer_price, incentive_amount, imei_serial, sale_date.strftime("%Y-%m-%d %H:%M:%S")
+                    ))
+                    
+                    conn.commit()
+                    st.success("Sale recorded successfully!")
+                except Exception as e:
+                    conn.rollback()
+                    st.error(f"Error recording sale: {str(e)}")
+        
+        except Exception as e:
+            st.error(f"Error simulating sale: {str(e)}")
+    
+    # Historical sales simulation
+    st.markdown("<h2 class='sub-header'>Historical Sales Analysis</h2>", unsafe_allow_html=True)
+    
+    try:
+        # Get historical sales data
+        cursor.execute("""
+        SELECT st.sale_id, d.dealer_name, p.product_name, s.scheme_name, 
+               st.quantity_sold, st.earned_dealer_incentive_amount, st.sale_timestamp
+        FROM sales_transactions st
+        JOIN dealers d ON st.dealer_id = d.dealer_id
+        JOIN products p ON st.product_id = p.product_id
+        JOIN schemes s ON st.scheme_id = s.scheme_id
+        ORDER BY st.sale_timestamp DESC
+        LIMIT 20
+        """)
+        
+        sales = cursor.fetchall()
+        
+        if sales and len(sales) > 0:
+            # Convert to DataFrame
+            sales_df = pd.DataFrame([dict(s) for s in sales])
+            
+            # Select columns to display
+            display_columns = [
+                'dealer_name', 'product_name', 'scheme_name', 'quantity_sold',
+                'earned_dealer_incentive_amount', 'sale_timestamp'
+            ]
+            
+            # Filter columns that exist in the DataFrame
+            display_columns = [col for col in display_columns if col in sales_df.columns]
+            
+            # Rename columns for display
+            rename_map = {
+                'dealer_name': 'Dealer',
+                'product_name': 'Product',
+                'scheme_name': 'Scheme',
+                'quantity_sold': 'Quantity',
+                'earned_dealer_incentive_amount': 'Incentive Amount',
+                'sale_timestamp': 'Sale Date'
+            }
+            
+            # Create display DataFrame
+            display_df = sales_df[display_columns].rename(columns=rename_map)
+            
+            # Display as table
+            st.markdown("<div class='table-container'>", unsafe_allow_html=True)
+            st.dataframe(display_df, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            # Sales trend visualization
+            st.markdown("<h3>Sales Trend</h3>", unsafe_allow_html=True)
+            
+            # Convert timestamp to datetime
+            sales_df['sale_timestamp'] = pd.to_datetime(sales_df['sale_timestamp'])
+            
+            # Group by date
+            sales_df['date'] = sales_df['sale_timestamp'].dt.date
+            trend_df = sales_df.groupby('date').agg({
+                'earned_dealer_incentive_amount': 'sum',
+                'sale_id': 'count'
+            }).reset_index()
+            
+            trend_df.columns = ['Date', 'Incentive Amount', 'Sales Count']
+            
+            # Create line chart
+            fig = px.line(
+                trend_df,
+                x='Date',
+                y=['Incentive Amount', 'Sales Count'],
+                labels={'value': 'Value', 'variable': 'Metric'},
+                title='Sales Trend Over Time',
+                color_discrete_sequence=['#1976D2', '#FFC107']
+            )
+            
+            fig.update_layout(
+                height=400,
+                margin=dict(l=20, r=20, t=40, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True, key="sales_trend_chart")
+        else:
+            st.info("No sales data available yet.")
+    except Exception as e:
+        st.error(f"Error retrieving sales data: {str(e)}")
+    
+    conn.close()
+
+# Upload Scheme
+def render_upload_scheme():
+    """Render the scheme upload page"""
+    st.markdown("<h1 class='main-header'>Upload Scheme</h1>", unsafe_allow_html=True)
+    
+    # Load secrets
+    secrets = load_secrets()
+    
+    # Initialize AWS clients
+    bedrock_client, textract_client = initialize_aws_clients(secrets)
+    
+    # Upload form
+    st.markdown("<h2 class='sub-header'>Upload Scheme Document</h2>", unsafe_allow_html=True)
+    
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    
+    if uploaded_file is not None:
+        # Save uploaded file
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        uploads_dir = os.path.join(current_dir, 'uploads')
+        os.makedirs(uploads_dir, exist_ok=True)
+        
+        file_path = os.path.join(uploads_dir, uploaded_file.name)
+        
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        st.success(f"File uploaded successfully: {uploaded_file.name}")
+        
+        # Process PDF
         with st.spinner("Extracting text from PDF..."):
-            extracted_text = extract_text_from_pdf(st.session_state.uploaded_pdf)
-            st.session_state.extracted_text = extracted_text
-        
-        # Display extracted text
-        st.markdown("<h2 class='sub-header'>Extracted Text</h2>", unsafe_allow_html=True)
-        with st.expander("Show Extracted Text", expanded=False):
-            for page_num, text in extracted_text:
-                st.markdown(f"### Page {page_num}")
-                st.text(text)
+            pages_text = extract_text_from_pdf(file_path, textract_client)
+            
+            if not pages_text or len(pages_text) == 0:
+                st.error("Failed to extract text from the PDF. Please try another file.")
+                return
+            
+            # Combine all pages text
+            all_text = "\n".join([page[1] for page in pages_text])
+            
+            # Save extracted text
+            raw_texts_dir = os.path.join(current_dir, 'raw_texts')
+            os.makedirs(raw_texts_dir, exist_ok=True)
+            
+            text_file_name = os.path.splitext(uploaded_file.name)[0] + "_raw.txt"
+            text_file_path = os.path.join(raw_texts_dir, text_file_name)
+            
+            with open(text_file_path, "w", encoding="utf-8") as f:
+                f.write(all_text)
         
         # Extract structured data
         with st.spinner("Extracting structured data..."):
-            structured_data = extract_structured_data_from_text(extracted_text)
-            st.session_state.structured_data = structured_data
+            inference_profile_arn = secrets.get('INFERENCE_PROFILE_CLAUDE')
+            
+            structured_data = extract_structured_data_from_text(
+                all_text, uploaded_file.name, bedrock_client, inference_profile_arn
+            )
+            
+            if not structured_data:
+                st.error("Failed to extract structured data from the PDF. Please try another file.")
+                return
         
-        # Display structured data
+        # Display extracted data
         st.markdown("<h2 class='sub-header'>Extracted Scheme Data</h2>", unsafe_allow_html=True)
         
-        # Scheme details
-        st.markdown("<h3>Scheme Details</h3>", unsafe_allow_html=True)
-        scheme_name = structured_data.get("scheme_name", "Unknown Scheme")
-        scheme_type = structured_data.get("scheme_type", "Unknown Type")
-        scheme_period_start = structured_data.get("scheme_period_start", "Unknown")
-        scheme_period_end = structured_data.get("scheme_period_end", "Unknown")
-        applicable_region = structured_data.get("applicable_region", "Unknown")
-        dealer_type_eligibility = structured_data.get("dealer_type_eligibility", "Unknown")
-        
         col1, col2 = st.columns(2)
+        
         with col1:
-            st.text_input("Scheme Name", value=scheme_name, key="scheme_name")
-            st.text_input("Scheme Type", value=scheme_type, key="scheme_type")
-            st.text_input("Start Date", value=scheme_period_start, key="scheme_period_start")
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown(f"**Scheme Name:** {structured_data.get('scheme_name', 'N/A')}")
+            st.markdown(f"**Scheme Type:** {structured_data.get('scheme_type', 'N/A')}")
+            st.markdown(f"**Period:** {structured_data.get('scheme_period_start', 'N/A')} to {structured_data.get('scheme_period_end', 'N/A')}")
+            st.markdown("</div>", unsafe_allow_html=True)
+        
         with col2:
-            st.text_input("End Date", value=scheme_period_end, key="scheme_period_end")
-            st.text_input("Region", value=applicable_region, key="applicable_region")
-            st.text_input("Dealer Eligibility", value=dealer_type_eligibility, key="dealer_type_eligibility")
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown(f"**Region:** {structured_data.get('applicable_region', 'All Regions')}")
+            st.markdown(f"**Dealer Eligibility:** {structured_data.get('dealer_type_eligibility', 'All Dealers')}")
+            st.markdown("</div>", unsafe_allow_html=True)
         
-        # Products
-        st.markdown("<h3>Products</h3>", unsafe_allow_html=True)
-        products = structured_data.get("products", [])
-        
-        for i, product in enumerate(products):
-            st.markdown(f"#### Product {i+1}")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.text_input("Product Name", value=product.get("product_name", ""), key=f"product_name_{i}")
-                st.text_input("Product Code", value=product.get("product_code", ""), key=f"product_code_{i}")
-                st.text_input("Category", value=product.get("product_category", ""), key=f"product_category_{i}")
-            with col2:
-                st.text_input("Support Type", value=product.get("support_type", ""), key=f"support_type_{i}")
-                st.text_input("Payout Type", value=product.get("payout_type", ""), key=f"payout_type_{i}")
-                st.text_input("Payout Amount", value=str(product.get("payout_amount", "")), key=f"payout_amount_{i}")
-                st.text_input("Free Item", value=product.get("free_item_description", ""), key=f"free_item_{i}")
-        
-        # Rules
-        st.markdown("<h3>Rules</h3>", unsafe_allow_html=True)
-        rules = structured_data.get("scheme_rules", [])
-        
-        for i, rule in enumerate(rules):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.text_input("Rule Type", value=rule.get("rule_type", ""), key=f"rule_type_{i}")
-            with col2:
-                st.text_input("Rule Description", value=rule.get("rule_description", ""), key=f"rule_description_{i}")
-        
-        # Save to database
-        if st.button("Save Scheme"):
-            with st.spinner("Saving scheme to database..."):
-                # Update structured data with edited values
-                structured_data["scheme_name"] = st.session_state.scheme_name
-                structured_data["scheme_type"] = st.session_state.scheme_type
-                structured_data["scheme_period_start"] = st.session_state.scheme_period_start
-                structured_data["scheme_period_end"] = st.session_state.scheme_period_end
-                structured_data["applicable_region"] = st.session_state.applicable_region
-                structured_data["dealer_type_eligibility"] = st.session_state.dealer_type_eligibility
+        # Display products
+        if 'products' in structured_data and structured_data['products']:
+            st.markdown("<h3>Products</h3>", unsafe_allow_html=True)
+            
+            for product in structured_data['products']:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
                 
-                for i, product in enumerate(products):
-                    product["product_name"] = st.session_state[f"product_name_{i}"]
-                    product["product_code"] = st.session_state[f"product_code_{i}"]
-                    product["product_category"] = st.session_state[f"product_category_{i}"]
-                    product["support_type"] = st.session_state[f"support_type_{i}"]
-                    product["payout_type"] = st.session_state[f"payout_type_{i}"]
-                    product["payout_amount"] = float(st.session_state[f"payout_amount_{i}"])
-                    product["free_item_description"] = st.session_state[f"free_item_{i}"]
+                col1, col2 = st.columns(2)
                 
-                for i, rule in enumerate(rules):
-                    rule["rule_type"] = st.session_state[f"rule_type_{i}"]
-                    rule["rule_description"] = st.session_state[f"rule_description_{i}"]
+                with col1:
+                    st.markdown(f"**Product:** {product.get('product_name', 'N/A')}")
+                    st.markdown(f"**Category:** {product.get('product_category', 'N/A')}")
+                    st.markdown(f"**Specifications:** {product.get('ram', 'N/A')} RAM, {product.get('storage', 'N/A')} Storage")
                 
-                # Save to database
-                scheme_id = add_new_scheme_from_data(structured_data, st.session_state.uploaded_pdf)
+                with col2:
+                    st.markdown(f"**Support Type:** {product.get('support_type', 'N/A')}")
+                    
+                    if product.get('payout_type') == 'Fixed':
+                        st.markdown(f"**Payout:** ₹{product.get('payout_amount', 0)} {product.get('payout_unit', '')}")
+                    elif product.get('payout_type') == 'Percentage':
+                        st.markdown(f"**Payout:** {product.get('payout_amount', 0)}% {product.get('payout_unit', '')}")
+                    else:
+                        st.markdown(f"**Payout:** {product.get('payout_amount', 0)} {product.get('payout_unit', '')}")
                 
-                if scheme_id:
-                    st.success("Scheme saved successfully! Awaiting approval.")
-                    # Clear session state
-                    st.session_state.uploaded_pdf = None
-                    st.session_state.extracted_text = None
-                    st.session_state.structured_data = None
-                    # Navigate to schemes page
-                    navigate_to("schemes")
-                else:
-                    st.error("Failed to save scheme. Please try again.")
+                # Display free item if available
+                if product.get('free_item_description'):
+                    st.markdown("<div class='free-item-alert'>", unsafe_allow_html=True)
+                    st.markdown(f"**🎁 Free Item:** {product.get('free_item_description')}")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Display rules
+        if 'scheme_rules' in structured_data and structured_data['scheme_rules']:
+            st.markdown("<h3>Rules</h3>", unsafe_allow_html=True)
+            
+            for rule in structured_data['scheme_rules']:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"**Rule Type:** {rule.get('rule_type', 'N/A')}")
+                st.markdown(f"**Description:** {rule.get('rule_description', 'N/A')}")
+                st.markdown(f"**Value:** {rule.get('rule_value', 'N/A')}")
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Save to database button
+        if st.button("Save to Database"):
+            try:
+                # Connect to database
+                conn = connect_db()
+                cursor = conn.cursor()
+                
+                # Insert scheme
+                cursor.execute("""
+                INSERT INTO schemes (
+                    scheme_name, scheme_type, scheme_period_start, scheme_period_end,
+                    applicable_region, dealer_type_eligibility, scheme_document_name,
+                    raw_extracted_text_path, deal_status, approval_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    structured_data.get('scheme_name', 'Unnamed Scheme'),
+                    structured_data.get('scheme_type', None),
+                    structured_data.get('scheme_period_start', '2023-01-01'),
+                    structured_data.get('scheme_period_end', '2023-12-31'),
+                    structured_data.get('applicable_region', None),
+                    structured_data.get('dealer_type_eligibility', None),
+                    uploaded_file.name,
+                    text_file_path,
+                    'Active',
+                    'Pending'
+                ))
+                
+                scheme_id = cursor.lastrowid
+                
+                # Insert products
+                if 'products' in structured_data and structured_data['products']:
+                    for product_data in structured_data['products']:
+                        # Check if product exists
+                        cursor.execute(
+                            "SELECT product_id FROM products WHERE product_name = ?",
+                            (product_data.get('product_name', 'Unnamed Product'),)
+                        )
+                        
+                        product_result = cursor.fetchone()
+                        
+                        if product_result:
+                            product_id = product_result[0]
+                        else:
+                            # Insert new product
+                            cursor.execute("""
+                            INSERT INTO products (
+                                product_name, product_code, product_category, product_subcategory,
+                                ram, storage, connectivity, color, dealer_price_dp, mrp
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                product_data.get('product_name', 'Unnamed Product'),
+                                product_data.get('product_code', None),
+                                product_data.get('product_category', None),
+                                product_data.get('product_subcategory', None),
+                                product_data.get('ram', None),
+                                product_data.get('storage', None),
+                                product_data.get('connectivity', None),
+                                product_data.get('color', None),
+                                10000,  # Default dealer price
+                                12000   # Default MRP
+                            ))
+                            
+                            product_id = cursor.lastrowid
+                        
+                        # Insert scheme_product relationship
+                        cursor.execute("""
+                        INSERT INTO scheme_products (
+                            scheme_id, product_id, support_type, payout_type, payout_amount,
+                            payout_unit, dealer_contribution, total_payout, is_bundle_offer,
+                            bundle_price, is_upgrade_offer, free_item_description
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            scheme_id,
+                            product_id,
+                            product_data.get('support_type', None),
+                            product_data.get('payout_type', 'Fixed'),
+                            product_data.get('payout_amount', 0),
+                            product_data.get('payout_unit', None),
+                            product_data.get('dealer_contribution', 0),
+                            product_data.get('total_payout', product_data.get('payout_amount', 0)),
+                            1 if product_data.get('is_bundle_offer', False) else 0,
+                            product_data.get('bundle_price', 0),
+                            1 if product_data.get('is_upgrade_offer', False) else 0,
+                            product_data.get('free_item_description', None)
+                        ))
+                
+                # Insert rules
+                if 'scheme_rules' in structured_data and structured_data['scheme_rules']:
+                    for rule_data in structured_data['scheme_rules']:
+                        cursor.execute("""
+                        INSERT INTO scheme_rules (
+                            scheme_id, rule_type, rule_description, rule_value
+                        ) VALUES (?, ?, ?, ?)
+                        """, (
+                            scheme_id,
+                            rule_data.get('rule_type', None),
+                            rule_data.get('rule_description', None),
+                            rule_data.get('rule_value', None)
+                        ))
+                
+                conn.commit()
+                st.success("Scheme saved to database successfully!")
+                
+                # Redirect to scheme explorer
+                st.session_state.page = 'schemes'
+                st.rerun()
+            
+            except Exception as e:
+                if 'conn' in locals():
+                    conn.rollback()
+                st.error(f"Error saving scheme to database: {str(e)}")
+            
+            finally:
+                if 'conn' in locals():
+                    conn.close()
 
-# Approvals page
+# Approvals
 def render_approvals():
     """Render the approvals page"""
-    st.markdown("<h1 class='main-header'>Scheme Approvals</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 class='main-header'>Pending Approvals</h1>", unsafe_allow_html=True)
     
-    pending_schemes = get_pending_approvals()
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
     
-    if not pending_schemes:
-        st.info("No schemes pending approval.")
-        return
+    # Get pending approvals
+    cursor.execute("""
+    SELECT sa.approval_id, s.scheme_id, s.scheme_name, sa.requested_by, sa.approval_notes, sa.approval_status
+    FROM scheme_approvals sa
+    JOIN schemes s ON sa.scheme_id = s.scheme_id
+    WHERE sa.approval_status = 'Pending'
+    ORDER BY sa.approval_id DESC
+    """)
     
-    for scheme in pending_schemes:
-        st.markdown("<div class=\"card\">", unsafe_allow_html=True)
-        
-        # Safely access scheme attributes
-        scheme_name = scheme["scheme_name"] if "scheme_name" in scheme.keys() else "Unnamed Scheme"
-        scheme_type = scheme["scheme_type"] if "scheme_type" in scheme.keys() else "Unknown Type"
-        period_start = scheme["scheme_period_start"] if "scheme_period_start" in scheme.keys() else "Unknown"
-        period_end = scheme["scheme_period_end"] if "scheme_period_end" in scheme.keys() else "Unknown"
-        region = scheme["applicable_region"] if "applicable_region" in scheme.keys() else "Unknown"
-        eligibility = scheme["dealer_type_eligibility"] if "dealer_type_eligibility" in scheme.keys() else "Unknown"
-        upload_timestamp = scheme["upload_timestamp"] if "upload_timestamp" in scheme.keys() else "Unknown"
-        
-        st.markdown(f"### {scheme_name}")
-        st.markdown(f"**Type:** {scheme_type}")
-        st.markdown(f"**Period:** {period_start} to {period_end}")
-        st.markdown(f"**Region:** {region}")
-        st.markdown(f"**Dealer Eligibility:** {eligibility}")
-        st.markdown(f"**Uploaded:** {upload_timestamp}")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Approve", key=f"approve_{scheme['scheme_id']}"):
-                if update_scheme_status(scheme['scheme_id'], "Approved"):
-                    st.success("Scheme approved!")
-                    # Clear cache to refresh data
-                    get_active_schemes.cache_clear()
-                    get_pending_approvals.cache_clear()
-                    # Rerun to refresh page
-                    st.rerun()
-        with col2:
-            if st.button("Reject", key=f"reject_{scheme['scheme_id']}"):
-                if update_scheme_status(scheme['scheme_id'], "Rejected"):
-                    st.success("Scheme rejected!")
-                    # Clear cache to refresh data
-                    get_active_schemes.cache_clear()
-                    get_pending_approvals.cache_clear()
-                    # Rerun to refresh page
-                    st.rerun()
-        
-        st.markdown("</div>", unsafe_allow_html=True)
+    approvals = cursor.fetchall()
+    
+    if approvals and len(approvals) > 0:
+        for approval in approvals:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                st.markdown(f"### Scheme: {approval['scheme_name']}")
+                st.markdown(f"**Requested By:** {approval['requested_by']}")
+                st.markdown(f"**Notes:** {approval['approval_notes']}")
+            
+            with col2:
+                st.markdown(f"**Status:** {approval['approval_status']}")
+                
+                # Get scheme details
+                cursor.execute("SELECT * FROM schemes WHERE scheme_id = ?", (approval['scheme_id'],))
+                scheme = cursor.fetchone()
+                
+                if scheme:
+                    if st.button("View Details", key=f"view_approval_{approval['approval_id']}"):
+                        st.session_state.selected_scheme_id = approval['scheme_id']
+                        st.session_state.page = 'scheme_details'
+            
+            # Approval actions
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("Approve", key=f"approve_{approval['approval_id']}"):
+                    try:
+                        # Update approval status
+                        cursor.execute("""
+                        UPDATE scheme_approvals
+                        SET approval_status = 'Approved', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                        WHERE approval_id = ?
+                        """, ("Current User", approval['approval_id']))
+                        
+                        # Update scheme approval status
+                        cursor.execute("""
+                        UPDATE schemes
+                        SET approval_status = 'Approved', approved_by = ?, approval_timestamp = CURRENT_TIMESTAMP
+                        WHERE scheme_id = ?
+                        """, ("Current User", approval['scheme_id']))
+                        
+                        conn.commit()
+                        st.success("Scheme approved successfully!")
+                        st.rerun()
+                    
+                    except Exception as e:
+                        conn.rollback()
+                        st.error(f"Error approving scheme: {str(e)}")
+            
+            with col2:
+                if st.button("Reject", key=f"reject_{approval['approval_id']}"):
+                    try:
+                        # Update approval status
+                        cursor.execute("""
+                        UPDATE scheme_approvals
+                        SET approval_status = 'Rejected', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                        WHERE approval_id = ?
+                        """, ("Current User", approval['approval_id']))
+                        
+                        # Update scheme approval status
+                        cursor.execute("""
+                        UPDATE schemes
+                        SET approval_status = 'Rejected'
+                        WHERE scheme_id = ?
+                        """, (approval['scheme_id'],))
+                        
+                        conn.commit()
+                        st.success("Scheme rejected successfully!")
+                        st.rerun()
+                    
+                    except Exception as e:
+                        conn.rollback()
+                        st.error(f"Error rejecting scheme: {str(e)}")
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.info("No pending approvals found.")
+    
+    conn.close()
 
-# Simulate sales page
-def render_simulate_sales():
-    """Render the simulate sales page"""
-    st.markdown("<h1 class='main-header'>Simulate Sales</h1>", unsafe_allow_html=True)
+# Settings
+def render_settings():
+    """Render the settings page"""
+    st.markdown("<h1 class='main-header'>Settings</h1>", unsafe_allow_html=True)
     
-    # Form for simulation
-    st.markdown("<h2 class='sub-header'>Enter Sale Details</h2>", unsafe_allow_html=True)
+    # Load current secrets
+    secrets = load_secrets()
+    
+    # AWS settings
+    st.markdown("<h2 class='sub-header'>AWS Settings</h2>", unsafe_allow_html=True)
     
     col1, col2 = st.columns(2)
     
     with col1:
-        # Select dealer
-        dealers = get_all_dealers()
-        dealer_options = {}
-        for dealer in dealers:
-            if "dealer_id" in dealer.keys() and "dealer_name" in dealer.keys():
-                dealer_options[dealer["dealer_id"]] = dealer["dealer_name"]
-        
-        dealer_id = st.selectbox("Select Dealer", options=list(dealer_options.keys()), format_func=lambda x: dealer_options[x])
-        
-        # Select scheme
-        schemes = get_active_schemes()
-        scheme_options = {}
-        for scheme in schemes:
-            if "scheme_id" in scheme.keys() and "scheme_name" in scheme.keys():
-                scheme_options[scheme["scheme_id"]] = scheme["scheme_name"]
-        
-        scheme_id = st.selectbox("Select Scheme", options=list(scheme_options.keys()), format_func=lambda x: scheme_options[x])
+        aws_access_key = st.text_input("AWS Access Key ID", secrets.get('aws_access_key_id', ''))
+        aws_secret_key = st.text_input("AWS Secret Access Key", secrets.get('aws_secret_access_key', ''), type="password")
+        region = st.text_input("AWS Region", secrets.get('REGION', 'ap-south-1'))
     
     with col2:
-        # Select product based on scheme
-        products = get_scheme_products(scheme_id) if scheme_id else []
-        product_options = {}
-        for product in products:
-            if "product_id" in product.keys() and "product_name" in product.keys():
-                product_options[product["product_id"]] = product["product_name"]
-        
-        product_id = st.selectbox("Select Product", options=list(product_options.keys()), format_func=lambda x: product_options[x]) if products else None
-        
-        # Quantity
-        quantity = st.number_input("Quantity", min_value=1, value=1)
+        inference_profile = st.text_input("Claude Inference Profile ARN", secrets.get('INFERENCE_PROFILE_CLAUDE', ''))
+        s3_bucket = st.text_input("S3 Bucket Name", secrets.get('s3_bucket_name', ''))
+        container_name = st.text_input("Container Name", secrets.get('container_name', ''))
     
-    # Calculate dealer price and incentive
-    dealer_price = None
-    incentive = None
-    free_item = None
+    # API settings
+    st.markdown("<h2 class='sub-header'>API Settings</h2>", unsafe_allow_html=True)
     
-    if product_id and scheme_id:
-        # Find the selected product in the scheme products
-        selected_product = None
-        for p in products:
-            if "product_id" in p.keys() and p["product_id"] == product_id:
-                selected_product = p
-                break
-        
-        if selected_product:
-            # Calculate dealer price (simplified for simulation)
-            # Safely access dealer_price or use default
-            try:
-                dealer_price = selected_product["dealer_price"] if "dealer_price" in selected_product.keys() else 10000
-            except (KeyError, TypeError):
-                dealer_price = 10000  # Default value if not specified
+    tavily_api = st.text_input("Tavily API Key", secrets.get('TAVILY_API', ''), type="password")
+    
+    # Save settings
+    if st.button("Save Settings"):
+        try:
+            # Update secrets
+            updated_secrets = {
+                "aws_access_key_id": aws_access_key,
+                "aws_secret_access_key": aws_secret_key,
+                "INFERENCE_PROFILE_CLAUDE": inference_profile,
+                "REGION": region,
+                "TAVILY_API": tavily_api,
+                "FAISS_INDEX_PATH": secrets.get('FAISS_INDEX_PATH', 'faiss_index.bin'),
+                "METADATA_STORE_PATH": secrets.get('METADATA_STORE_PATH', 'metadata_store.pkl'),
+                "s3_bucket_name": s3_bucket,
+                "container_name": container_name
+            }
             
-            # Calculate incentive based on payout type
-            try:
-                payout_type = selected_product["payout_type"] if "payout_type" in selected_product.keys() else "Fixed"
-                payout_amount = selected_product["payout_amount"] if "payout_amount" in selected_product.keys() else 1000
-                
-                if payout_type == "Fixed":
-                    incentive = payout_amount * quantity
-                elif payout_type == "Percentage":
-                    incentive = (dealer_price * payout_amount / 100) * quantity
-                else:
-                    incentive = payout_amount * quantity
-            except (KeyError, TypeError):
-                incentive = 1000 * quantity  # Default value if calculation fails
+            # Save to file
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            secrets_path = os.path.join(current_dir, 'secrets.json')
             
-            # Check for free item
-            try:
-                free_item = selected_product["free_item_description"] if "free_item_description" in selected_product.keys() else None
-            except (KeyError, TypeError):
-                free_item = None
+            with open(secrets_path, 'w') as f:
+                json.dump(updated_secrets, f, indent=4)
+            
+            st.success("Settings saved successfully!")
+        
+        except Exception as e:
+            st.error(f"Error saving settings: {str(e)}")
     
-    # Display calculated values
-    if dealer_price is not None and incentive is not None:
-        st.markdown("<h2 class='sub-header'>Calculation</h2>", unsafe_allow_html=True)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Dealer Price", f"₹{dealer_price:,.2f}")
-        with col2:
-            st.metric("Total Value", f"₹{(dealer_price * quantity):,.2f}")
-        with col3:
-            st.metric("Incentive", f"₹{incentive:,.2f}")
-        
-        # Display free item if available
-        if free_item:
-            st.markdown(f"<div class='free-item-highlight'>🎁 FREE with this purchase: {free_item}</div>", unsafe_allow_html=True)
-            st.markdown("**Remember to inform the customer about this free item!**")
-        
-        # Simulate button
-        if st.button("Simulate Sale"):
-            if add_simulated_sale(dealer_id, product_id, scheme_id, quantity, dealer_price, incentive):
-                # Store simulation results
-                st.session_state.simulation_results = {
-                    "dealer_name": dealer_options[dealer_id],
-                    "scheme_name": scheme_options[scheme_id],
-                    "product_name": product_options[product_id],
-                    "quantity": quantity,
-                    "dealer_price": dealer_price,
-                    "total_value": dealer_price * quantity,
-                    "incentive": incentive,
-                    "free_item": free_item
-                }
-                st.session_state.show_simulation_results = True
+    # Database management
+    st.markdown("<h2 class='sub-header'>Database Management</h2>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Backup Database"):
+            try:
+                # Create backup
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                db_path = os.path.join(current_dir, 'dns_database.db')
+                backup_path = os.path.join(current_dir, f'dns_database_backup_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.db')
                 
-                # Clear cache to refresh data
-                get_sales_data.cache_clear()
+                shutil.copy2(db_path, backup_path)
+                st.success(f"Database backed up successfully to {backup_path}")
+            
+            except Exception as e:
+                st.error(f"Error backing up database: {str(e)}")
+    
+    with col2:
+        if st.button("Reset Sample Data"):
+            try:
+                # Connect to database
+                conn = connect_db()
+                cursor = conn.cursor()
                 
-                # Show success message
-                st.success("Sale simulated successfully!")
+                # Clear existing data
+                cursor.execute("DELETE FROM sales_transactions")
+                cursor.execute("DELETE FROM scheme_products")
+                cursor.execute("DELETE FROM scheme_rules")
+                cursor.execute("DELETE FROM scheme_parameters")
+                cursor.execute("DELETE FROM scheme_approvals")
+                cursor.execute("DELETE FROM bundle_offers")
+                cursor.execute("DELETE FROM schemes")
+                cursor.execute("DELETE FROM products")
+                cursor.execute("DELETE FROM dealers")
                 
-                # Show simulation results
-                st.markdown("<h2 class='sub-header'>Simulation Results</h2>", unsafe_allow_html=True)
-                st.markdown("<div class=\"card\">", unsafe_allow_html=True)
-                st.markdown(f"### Sale to {st.session_state.simulation_results['dealer_name']}")
-                st.markdown(f"**Product:** {st.session_state.simulation_results['product_name']}")
-                st.markdown(f"**Quantity:** {st.session_state.simulation_results['quantity']}")
-                st.markdown(f"**Total Value:** ₹{st.session_state.simulation_results['total_value']:,.2f}")
-                st.markdown(f"**Incentive Earned:** ₹{st.session_state.simulation_results['incentive']:,.2f}")
+                conn.commit()
+                conn.close()
                 
-                if st.session_state.simulation_results['free_item']:
-                    st.markdown(f"<div class='free-item-highlight'>🎁 FREE: {st.session_state.simulation_results['free_item']}</div>", unsafe_allow_html=True)
+                # Add sample data
+                from pdf_processor_fixed import add_sample_data
+                add_sample_data()
                 
-                st.markdown("</div>", unsafe_allow_html=True)
+                st.success("Sample data reset successfully!")
+            
+            except Exception as e:
+                if 'conn' in locals():
+                    conn.rollback()
+                st.error(f"Error resetting sample data: {str(e)}")
                 
-                # Customer prompt for free item
-                if st.session_state.simulation_results['free_item']:
-                    st.markdown("### Customer Prompt")
-                    st.markdown(f"""
-                    <div style="background-color: #E8F4F8; padding: 15px; border-radius: 10px; border-left: 5px solid #1E90FF;">
-                        <p style="font-size: 16px;">
-                            <strong>Say to customer:</strong><br>
-                            "Great choice! I'm happy to let you know that with your purchase of {st.session_state.simulation_results['product_name']}, 
-                            you'll also receive <strong>{st.session_state.simulation_results['free_item']}</strong> absolutely free! 
-                            This is part of our current promotion."
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.error("Failed to simulate sale. Please try again.")
+                if 'conn' in locals():
+                    conn.close()
+
+# Help
+def render_help():
+    """Render the help page"""
+    st.markdown("<h1 class='main-header'>Help & Documentation</h1>", unsafe_allow_html=True)
+    
+    st.markdown("""
+    ## About Dealer Nudging System (DNS)
+    
+    The Dealer Nudging System (DNS) is a comprehensive platform designed to help OEMs (Original Equipment Manufacturers) incentivize dealers to sell specific products through various schemes and offers.
+    
+    ### Key Features
+    
+    - **Scheme Management**: Upload, view, and manage dealer incentive schemes
+    - **Product Catalog**: Maintain a catalog of products with detailed specifications
+    - **Dealer Network**: Manage your dealer network and track performance
+    - **Sales Simulation**: Simulate sales to calculate incentives and free items
+    - **Performance Analytics**: Visualize scheme effectiveness and dealer performance
+    - **Approval Workflow**: Implement a structured approval process for scheme changes
+    
+    ### Getting Started
+    
+    1. **Dashboard**: Get an overview of active schemes, products, and performance metrics
+    2. **Scheme Explorer**: Browse and filter available schemes
+    3. **Products**: View the product catalog and performance data
+    4. **Dealers**: Manage your dealer network and view dealer performance
+    5. **Sales Simulation**: Simulate sales transactions to calculate incentives
+    6. **Upload Scheme**: Upload new scheme documents in PDF format
+    
+    ### Need Help?
+    
+    For additional assistance, please contact the system administrator.
+    """)
+    
+    # FAQ section
+    st.markdown("<h2 class='sub-header'>Frequently Asked Questions</h2>", unsafe_allow_html=True)
+    
+    faq_items = [
+        {
+            "question": "How do I upload a new scheme?",
+            "answer": "Navigate to the 'Upload Scheme' page from the sidebar, then upload a PDF document containing the scheme details. The system will automatically extract the scheme information and allow you to review it before saving to the database."
+        },
+        {
+            "question": "How does the approval workflow work?",
+            "answer": "When you edit a scheme, the changes are submitted for approval. Approvers can review the changes from the 'Approvals' page and either approve or reject them. Approved changes are immediately reflected in the system."
+        },
+        {
+            "question": "What happens when a scheme includes free items?",
+            "answer": "When a scheme includes free items, they are highlighted throughout the system. In the sales simulation, a special prompt is displayed to remind dealers to inform customers about the free items included with their purchase."
+        },
+        {
+            "question": "How can I see which schemes are performing best?",
+            "answer": "The Dashboard provides visualizations of scheme performance, including a bar chart of top-performing schemes by incentive amount and a product performance heatmap showing which products perform best under which schemes."
+        },
+        {
+            "question": "Can I export data from the system?",
+            "answer": "Currently, data export functionality is not implemented. However, you can take screenshots of the visualizations and tables for reporting purposes."
+        }
+    ]
+    
+    for i, faq in enumerate(faq_items):
+        with st.expander(faq["question"]):
+            st.markdown(faq["answer"])
 
 # Main function
 def main():
-    """Main function to run the Streamlit app"""
-    load_custom_css()
+    """Main application function"""
+    # Initialize session state
+    init_session_state()
+    
+    # Render sidebar
     render_sidebar()
     
-    # Render the appropriate page based on session state
-    if st.session_state.page == "dashboard":
+    # Render selected page
+    if st.session_state.page == 'dashboard':
         render_dashboard()
-    elif st.session_state.page == "schemes":
+    elif st.session_state.page == 'schemes':
         render_schemes()
-    elif st.session_state.page == "scheme_details":
+    elif st.session_state.page == 'scheme_details':
         render_scheme_details()
-    elif st.session_state.page == "upload":
-        render_upload()
-    elif st.session_state.page == "approvals":
-        render_approvals()
-    elif st.session_state.page == "simulate":
+    elif st.session_state.page == 'edit_scheme':
+        render_edit_scheme()
+    elif st.session_state.page == 'products':
+        render_products()
+    elif st.session_state.page == 'dealers':
+        render_dealers()
+    elif st.session_state.page == 'simulation':
         render_simulate_sales()
+    elif st.session_state.page == 'upload':
+        render_upload_scheme()
+    elif st.session_state.page == 'approvals':
+        render_approvals()
+    elif st.session_state.page == 'settings':
+        render_settings()
+    elif st.session_state.page == 'help':
+        render_help()
 
 if __name__ == "__main__":
     main()

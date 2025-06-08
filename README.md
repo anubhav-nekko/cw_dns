@@ -11,6 +11,7 @@ dns_complete/
 ├── app.py                  # Main Streamlit application
 ├── pdf_processor_fixed.py  # PDF extraction and database population module
 ├── setup.py                # Environment setup script
+├── sample_data.py          # Sample data generation module
 ├── documentation.md        # Comprehensive documentation
 ├── secrets.json            # AWS and API credentials
 ├── schemes/                # Directory for scheme PDF files
@@ -22,7 +23,7 @@ dns_complete/
 
 1. **Install Dependencies**:
    ```bash
-   pip install streamlit plotly pandas boto3 PyPDF2 Pillow pymupdf
+   pip install -r requirements.txt
    ```
 
 2. **Initialize the System**:
@@ -32,11 +33,9 @@ dns_complete/
    This will:
    - Create necessary directories
    - Initialize the database
-   - Copy sample PDFs to the schemes directory
    - Set up the secrets file
-   - Extract data from all PDFs in the schemes directory
-   - Populate the database with scheme details
-   - Create sample dealers and sales data
+   - Create sample data with 1-2 schemes
+   - Migrate database schema if needed
 
 3. **Run the Application**:
    ```bash
@@ -45,12 +44,24 @@ dns_complete/
 
 ## Key Features
 
-- Granular data model for mobile phone schemes
-- PDF extraction with AWS integration
-- Interactive dashboard with advanced visualizations
-- Scheme explorer with detailed filtering
-- Editable tables with approval workflow
-- Enhanced sales simulation
-- Comprehensive dealer and product management
+- **Granular data model** for mobile phone schemes
+- **PDF extraction** with AWS integration
+- **Interactive dashboard** with advanced visualizations
+- **Scheme explorer** with detailed filtering
+- **Editable tables** with approval workflow
+- **Enhanced sales simulation** with free item prompting
+- **Comprehensive dealer and product management**
+
+## Free Item Prompting
+
+The system now includes a special feature that prompts dealers about free items included in schemes. When a scheme includes free items (like headphones with a mobile phone), the sales simulation will display a suggested script for dealers to use when informing customers about these free items.
+
+## PDF Upload
+
+You can upload new scheme PDFs during live demos. The system will:
+1. Extract text from the PDF
+2. Process the text to identify scheme details, products, and free items
+3. Allow you to review the extracted data
+4. Save the scheme to the database
 
 For detailed documentation, please refer to `documentation.md`.

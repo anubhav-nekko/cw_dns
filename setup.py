@@ -1,8 +1,8 @@
 import os
-import json
 import sqlite3
+import json
 import shutil
-from pdf_processor_fixed import create_tables, add_sample_data
+from sample_data import add_sample_data
 
 def setup_environment():
     """Set up the environment for the DNS application"""
@@ -71,6 +71,7 @@ def setup_environment():
         conn.close()
     else:
         # Create new database with tables
+        from pdf_processor_fixed import create_tables
         create_tables()
         add_sample_data()
 
