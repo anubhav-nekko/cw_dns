@@ -9,7 +9,7 @@ import datetime
 import uuid
 import tempfile
 import shutil
-from pdf_processor_fixed import extract_text_from_pdf, extract_structured_data_from_text, connect_db, initialize_aws_clients
+from pdf_processor_fixed import extract_text_from_pdf, extract_structured_data_from_text, connect_db, initialize_aws_clients, normalize_field
 
 # Set page configuration
 st.set_page_config(
@@ -144,6 +144,19 @@ def init_session_state():
     
     if 'selected_product_id' not in st.session_state:
         st.session_state.selected_product_id = None
+    
+    # New – Cart Mode defaults
+    cart_defaults = {
+        "cart_items": [],
+        "selected_offer": None,
+        "available_offers": []
+    }
+    for k, v in cart_defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    if 'billing_date' not in st.session_state:
+        st.session_state.billing_date = datetime.date.today()
 
 # Navigation
 def render_sidebar():
@@ -165,6 +178,9 @@ def render_sidebar():
     
     if st.sidebar.button("💰 Sales Simulation", key="nav_simulation"):
         st.session_state.page = 'simulation'
+
+    if st.sidebar.button("🛒 Cart Mode", key="nav_cart"):
+        st.session_state.page = 'cart'
     
     if st.sidebar.button("📤 Upload Scheme", key="nav_upload"):
         st.session_state.page = 'upload'
@@ -1448,6 +1464,455 @@ def render_simulate_sales():
     
     conn.close()
 
+
+# Cart Mode
+def render_cart_mode():
+    """Render the cart mode page"""
+    st.markdown("<h1 class='main-header'>Cart Mode</h1>", unsafe_allow_html=True)
+    st.markdown("Simulate a shop billing experience. Add products to the cart and see applicable offers in real-time.")
+    
+    # Connect to database
+    conn = connect_db()
+    cursor = conn.cursor()
+    
+    # Layout with two columns
+    col1, col2 = st.columns([3, 2])
+    
+    with col1:
+        st.markdown("<h2 class='sub-header'>Product Selection</h2>", unsafe_allow_html=True)
+        
+        # Dealer selection
+        cursor.execute("SELECT dealer_id, dealer_name, dealer_type, region FROM dealers WHERE is_active = 1")
+        dealers = cursor.fetchall()
+        
+        dealer_options = {f"{dealer[1]} ({dealer[2]}, {dealer[3]})": dealer[0] for dealer in dealers}
+        selected_dealer_name = st.selectbox("Select Dealer", list(dealer_options.keys()), key="cart_dealer_select")
+        selected_dealer_id = dealer_options[selected_dealer_name]
+        
+        # Get dealer details for offer matching
+        cursor.execute("SELECT dealer_type, region, state, city FROM dealers WHERE dealer_id = ?", (selected_dealer_id,))
+        dealer_details = cursor.fetchone()
+        dealer_type = dealer_details[0]
+        dealer_region = dealer_details[1]
+        dealer_state = dealer_details[2]
+        dealer_city = dealer_details[3]
+        
+        # Product category filter
+        cursor.execute("SELECT DISTINCT product_category FROM products WHERE is_active = 1")
+        categories = [row[0] for row in cursor.fetchall()]
+        selected_category = st.selectbox("Product Category", categories, key="cart_category_filter")
+        
+        # Product selection
+        cursor.execute("""
+        SELECT product_id, product_name, product_code, ram, storage, color, dealer_price_dp, mrp
+        FROM products
+        WHERE product_category = ? AND is_active = 1
+        ORDER BY product_name
+        """, (selected_category,))
+        
+        products = cursor.fetchall()
+        
+        if products:
+            # Create a DataFrame for better display
+            product_df = pd.DataFrame(products, columns=[
+                'product_id', 'Product Name', 'Product Code', 'RAM', 'Storage', 'Color', 'Dealer Price', 'MRP'
+            ])
+            
+            # Display products in a table with add button
+            st.markdown("<div class='table-container'>", unsafe_allow_html=True)
+            for i, row in product_df.iterrows():
+                col_a, col_b, col_c = st.columns([3, 1, 1])
+                
+                with col_a:
+                    st.write(f"**{row['Product Name']}** ({row['Product Code']})")
+                    st.write(f"{row['RAM']} | {row['Storage']} | {row['Color']}")
+                
+                with col_b:
+                    st.write(f"₹{row['Dealer Price']:,.2f}")
+                    st.write(f"MRP: ₹{row['MRP']:,.2f}")
+                
+                with col_c:
+                    quantity = st.number_input("Qty", min_value=1, max_value=10, value=1, step=1, key=f"qty_{row['product_id']}")
+                    if st.button("Add to Cart", key=f"add_{row['product_id']}"):
+                        # Check if product already in cart
+                        product_in_cart = False
+                        for i, item in enumerate(st.session_state.cart_items):
+                            if item['product_id'] == row['product_id']:
+                                # Update quantity
+                                st.session_state.cart_items[i]['quantity'] += quantity
+                                product_in_cart = True
+                                break
+                        
+                        if not product_in_cart:
+                            # Add new item to cart
+                            st.session_state.cart_items.append({
+                                'product_id': row['product_id'],
+                                'product_name': row['Product Name'],
+                                'product_code': row['Product Code'],
+                                'dealer_price': row['Dealer Price'],
+                                'mrp': row['MRP'],
+                                'quantity': quantity
+                            })
+                        
+                        # Update available offers
+                        st.session_state.available_offers = find_applicable_offers(
+                            st.session_state.cart_items, 
+                            dealer_type, 
+                            dealer_region,
+                            dealer_state,
+                            dealer_city
+                        )
+                        
+                        # Reset selected offer if not applicable anymore
+                        if st.session_state.selected_offer:
+                            offer_still_valid = False
+                            for offer in st.session_state.available_offers:
+                                if offer['scheme_id'] == st.session_state.selected_offer['scheme_id']:
+                                    offer_still_valid = True
+                                    break
+                            
+                            if not offer_still_valid:
+                                st.session_state.selected_offer = None
+                        
+                        st.rerun()
+                
+                st.markdown("<hr>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.info("No products available in this category.")
+    
+    with col2:
+        # Billing-date picker (defaults to today)
+        st.session_state.billing_date = st.date_input(
+            "Billing Date (for invoice)",
+            value=st.session_state.billing_date,
+            key="cart_billing_date",
+            )
+        st.markdown("<h2 class='sub-header'>Shopping Cart</h2>", unsafe_allow_html=True)
+        
+        if not st.session_state.cart_items:
+            st.info("Your cart is empty. Add products to see available offers.")
+        else:
+            # Display cart items
+            for i, item in enumerate(st.session_state.cart_items):
+                st.markdown(
+                    f"""
+                    <div class='cart-item'>
+                        <div>
+                            <strong>{item['product_name']}</strong><br>
+                            {item['product_code']}
+                        </div>
+                        <div>
+                            {item['quantity']} × ₹{item['dealer_price']:,.2f}
+                        </div>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+                
+                col_a, col_b = st.columns([1, 1])
+                with col_a:
+                    new_qty = st.number_input(
+                        "Quantity", 
+                        min_value=1, 
+                        max_value=10, 
+                        value=item['quantity'], 
+                        step=1, 
+                        key=f"cart_qty_{i}"
+                    )
+                    if new_qty != item['quantity']:
+                        st.session_state.cart_items[i]['quantity'] = new_qty
+                        
+                        # Update available offers
+                        st.session_state.available_offers = find_applicable_offers(
+                            st.session_state.cart_items, 
+                            dealer_type, 
+                            dealer_region,
+                            dealer_state,
+                            dealer_city
+                        )
+                        st.rerun()
+                
+                with col_b:
+                    if st.button("Remove", key=f"remove_{i}"):
+                        st.session_state.cart_items.pop(i)
+                        
+                        # Update available offers
+                        st.session_state.available_offers = find_applicable_offers(
+                            st.session_state.cart_items, 
+                            dealer_type, 
+                            dealer_region,
+                            dealer_state,
+                            dealer_city
+                        )
+                        
+                        # Reset selected offer if cart is empty
+                        if not st.session_state.cart_items:
+                            st.session_state.selected_offer = None
+                            st.session_state.available_offers = []
+                        
+                        st.rerun()
+            
+            # Calculate cart total
+            subtotal = sum(item['dealer_price'] * item['quantity'] for item in st.session_state.cart_items)
+            
+            # Apply selected offer if any
+            discount = 0
+            if st.session_state.selected_offer:
+                discount = calculate_offer_benefit(st.session_state.cart_items, st.session_state.selected_offer)
+            
+            total = subtotal - discount
+            
+            # Display cart total
+            st.markdown(
+                f"""
+                <div class='cart-total'>
+                    <span>Subtotal:</span>
+                    <span>₹{subtotal:,.2f}</span>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
+            
+            if discount > 0:
+                st.markdown(
+                    f"""
+                    <div class='cart-total' style='background-color: #e8f5e9;'>
+                        <span>Discount:</span>
+                        <span>-₹{discount:,.2f}</span>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+            
+            st.markdown(
+                f"""
+                <div class='cart-total' style='background-color: #bbdefb; font-size: 1.4rem;'>
+                    <span>Total:</span>
+                    <span>₹{total:,.2f}</span>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
+            
+            # Cart actions
+            st.markdown("<div class='cart-actions'>", unsafe_allow_html=True)
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                if st.button("Clear Cart", key="clear_cart"):
+                    st.session_state.cart_items = []
+                    st.session_state.selected_offer = None
+                    st.session_state.available_offers = []
+                    st.rerun()
+            
+            with col_b:
+                if st.button("Checkout", key="checkout"):
+                    # Record the transaction
+                    try:
+                        sale_ts = datetime.datetime.combine( 
+                            st.session_state.billing_date, 
+                            datetime.datetime.now().time()
+                            ).strftime('%Y-%m-%d %H:%M:%S')
+                        for item in st.session_state.cart_items:
+                            scheme_id = None
+                            earned_incentive = 0
+                            
+                            if st.session_state.selected_offer:
+                                scheme_id = st.session_state.selected_offer['scheme_id']
+                                # Calculate per-item incentive
+                                if item['product_id'] in st.session_state.selected_offer['applicable_products']:
+                                    if st.session_state.selected_offer['payout_type'] == 'Fixed':
+                                        earned_incentive = st.session_state.selected_offer['payout_amount'] * item['quantity']
+                                    elif st.session_state.selected_offer['payout_type'] == 'Percentage':
+                                        earned_incentive = (item['dealer_price'] * st.session_state.selected_offer['payout_amount'] / 100) * item['quantity']
+                            
+                            # Generate random IMEI
+                            import random
+                            imei = ''.join([str(random.randint(0, 9)) for _ in range(15)])
+                            
+                            # Record sale
+                            cursor.execute(""" 
+                            INSERT INTO sales_transactions (
+                                dealer_id, scheme_id, product_id, quantity_sold, dealer_price_dp,
+                                earned_dealer_incentive_amount, imei_serial, sale_timestamp
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, ( 
+                                selected_dealer_id,
+                                scheme_id, 
+                                item['product_id'], 
+                                item['quantity'],
+                                item['dealer_price'],
+                                earned_incentive,
+                                imei,
+                                sale_ts,
+                            ))
+                        
+                        conn.commit()
+                        st.success("Transaction completed successfully!")
+                        
+                        # Clear cart
+                        st.session_state.cart_items = []
+                        st.session_state.selected_offer = None
+                        st.session_state.available_offers = []
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error recording transaction: {str(e)}")
+                        conn.rollback()
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Available offers section
+        st.markdown("<h2 class='sub-header'>Available Offers</h2>", unsafe_allow_html=True)
+        
+        if not st.session_state.available_offers:
+            if st.session_state.cart_items:
+                st.info("No applicable offers available for the current cart.")
+            else:
+                st.info("Add products to the cart to see available offers.")
+        else:
+            for offer in st.session_state.available_offers:
+                # Calculate benefit amount
+                benefit = calculate_offer_benefit(st.session_state.cart_items, offer)
+                
+                # Check if this offer is selected
+                is_selected = (st.session_state.selected_offer and 
+                              st.session_state.selected_offer['scheme_id'] == offer['scheme_id'])
+                
+                # Display offer card
+                st.markdown(
+                    f"""
+                    <div class='offer-card {"selected" if is_selected else ""}'>
+                        <strong>{offer['scheme_name']}</strong>
+                        <div class='benefit-tag'>₹{benefit:,.2f} benefit</div>
+                        <p>{offer['description']}</p>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+                
+                if is_selected:
+                    if st.button("Remove Offer", key=f"remove_offer_{offer['scheme_id']}"):
+                        st.session_state.selected_offer = None
+                        st.rerun()
+                else:
+                    if st.button("Apply Offer", key=f"apply_offer_{offer['scheme_id']}"):
+                        st.session_state.selected_offer = offer
+                        st.rerun()
+    
+    conn.close()
+
+def find_applicable_offers(cart_items, dealer_type, dealer_region, dealer_state, dealer_city):
+    """Find offers applicable to the current cart"""
+    if not cart_items:
+        return []
+    
+    conn = connect_db()
+    cursor = conn.cursor()
+    
+    # Get product IDs in cart
+    product_ids = [item['product_id'] for item in cart_items]
+    product_ids_str = ','.join('?' for _ in product_ids)
+    
+    # Calculate cart total
+    cart_total = sum(item['dealer_price'] * item['quantity'] for item in cart_items)
+    
+    # Find schemes that match dealer criteria and have products in the cart
+    cursor.execute(f"""
+    SELECT DISTINCT s.scheme_id, s.scheme_name, s.scheme_type, s.notes
+    FROM schemes s
+    JOIN scheme_products sp ON s.scheme_id = sp.scheme_id
+    WHERE s.deal_status = 'Active'
+    AND s.approval_status = 'Approved'
+    AND (s.dealer_type_eligibility = 'All Dealers' OR s.dealer_type_eligibility = ?)
+    AND (s.applicable_region = 'All India' OR s.applicable_region = ?)
+    AND sp.product_id IN ({product_ids_str})
+    AND datetime('now') BETWEEN datetime(s.scheme_period_start) AND datetime(s.scheme_period_end)
+    """, [dealer_type, dealer_region] + product_ids)
+    
+    schemes = cursor.fetchall()
+    
+    applicable_offers = []
+    
+    for scheme in schemes:
+        scheme_id = scheme[0]
+        scheme_name = scheme[1]
+        scheme_type = scheme[2]
+        notes = scheme[3] or ""
+        
+        # Get scheme products and their payout details
+        cursor.execute("""
+        SELECT sp.product_id, sp.support_type, sp.payout_type, sp.payout_amount, sp.payout_unit,
+               sp.is_bundle_offer, sp.is_upgrade_offer, sp.free_item_description
+        FROM scheme_products sp
+        WHERE sp.scheme_id = ?
+        """, (scheme_id,))
+        
+        scheme_products = cursor.fetchall()
+        
+        # Check if any products in cart match scheme products
+        applicable_products = []
+        for product in scheme_products:
+            product_id = product[0]
+            if product_id in product_ids:
+                applicable_products.append(product_id)
+        
+        if applicable_products:
+            # Get payout details from first applicable product (simplified)
+            for product in scheme_products:
+                if product[0] in applicable_products:
+                    support_type = product[1]
+                    payout_type = product[2]
+                    payout_amount = product[3]
+                    payout_unit = product[4]
+                    is_bundle = product[5]
+                    is_upgrade = product[6]
+                    free_item = product[7]
+                    break
+            
+            # Create description based on scheme type and payout
+            if payout_type == 'Fixed':
+                description = f"{support_type}: ₹{payout_amount} {payout_unit}"
+            elif payout_type == 'Percentage':
+                description = f"{support_type}: {payout_amount}% {payout_unit}"
+            else:
+                description = support_type
+            
+            # Add free item info if available
+            if free_item:
+                description += f" + Free {free_item}"
+            
+            # Add notes if available
+            if notes:
+                description += f" ({notes})"
+            
+            applicable_offers.append({
+                'scheme_id': scheme_id,
+                'scheme_name': scheme_name,
+                'scheme_type': scheme_type,
+                'description': description,
+                'payout_type': payout_type,
+                'payout_amount': payout_amount,
+                'applicable_products': applicable_products,
+                'free_item': free_item
+            })
+    
+    conn.close()
+    return applicable_offers
+
+def calculate_offer_benefit(cart_items, offer):
+    """Calculate the benefit amount for an offer"""
+    benefit = 0
+    
+    for item in cart_items:
+        if item['product_id'] in offer['applicable_products']:
+            if offer['payout_type'] == 'Fixed':
+                benefit += offer['payout_amount'] * item['quantity']
+            elif offer['payout_type'] == 'Percentage':
+                benefit += (item['dealer_price'] * offer['payout_amount'] / 100) * item['quantity']
+    
+    return benefit
+
 # Upload Scheme
 def render_upload_scheme():
     """Render the scheme upload page"""
@@ -1577,115 +2042,149 @@ def render_upload_scheme():
                 # Connect to database
                 conn = connect_db()
                 cursor = conn.cursor()
-                
-                # Insert scheme
-                cursor.execute("""
-                INSERT INTO schemes (
-                    scheme_name, scheme_type, scheme_period_start, scheme_period_end,
-                    applicable_region, dealer_type_eligibility, scheme_document_name,
-                    raw_extracted_text_path, deal_status, approval_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    structured_data.get('scheme_name', 'Unnamed Scheme'),
-                    structured_data.get('scheme_type', None),
-                    structured_data.get('scheme_period_start', '2023-01-01'),
-                    structured_data.get('scheme_period_end', '2023-12-31'),
-                    structured_data.get('applicable_region', None),
-                    structured_data.get('dealer_type_eligibility', None),
-                    uploaded_file.name,
-                    text_file_path,
-                    'Active',
-                    'Pending'
-                ))
-                
+
+                # --- 2.a  NORMALISE the top‑level scheme fields -----------------
+                scheme_name = normalize_field(structured_data.get("scheme_name"), str, "Unnamed Scheme")
+                scheme_type = normalize_field(structured_data.get("scheme_type"), str, None)
+                scheme_period_start = normalize_field(structured_data.get("scheme_period_start"), str, "2023-01-01")
+                scheme_period_end = normalize_field(structured_data.get("scheme_period_end"), str, "2023-12-31")
+                applicable_region = normalize_field(structured_data.get("applicable_region"), str, None)
+                dealer_type_eligibility = normalize_field(structured_data.get("dealer_type_eligibility"), str, None)
+
+                # --- 2.b  Insert the scheme record ------------------------------
+                cursor.execute(
+                    """
+                    INSERT INTO schemes (
+                        scheme_name, scheme_type, scheme_period_start, scheme_period_end,
+                        applicable_region, dealer_type_eligibility, scheme_document_name,
+                        raw_extracted_text_path, deal_status, approval_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scheme_name,
+                        scheme_type,
+                        scheme_period_start,
+                        scheme_period_end,
+                        applicable_region,
+                        dealer_type_eligibility,
+                        uploaded_file.name,
+                        text_file_path,
+                        "Active",
+                        "Pending",
+                    ),
+                )
                 scheme_id = cursor.lastrowid
-                
-                # Insert products
-                if 'products' in structured_data and structured_data['products']:
-                    for product_data in structured_data['products']:
-                        # Check if product exists
+
+                # --- 2.c  Loop through products with *all* fields normalised ----
+                for product_data in structured_data.get("products", []):
+                    # Normalise every relevant attribute using `normalize_field`
+                    product_name = normalize_field(product_data.get("product_name"), str, f"Product {uuid.uuid4().hex[:8]}")
+                    product_code = normalize_field(product_data.get("product_code"), str, f"CODE-{uuid.uuid4().hex[:8]}")
+                    product_category = normalize_field(product_data.get("product_category"), str, "Mobile")
+                    product_subcategory = normalize_field(product_data.get("product_subcategory"), str, "Other")
+                    ram = normalize_field(product_data.get("ram"), str)
+                    storage = normalize_field(product_data.get("storage"), str)
+                    connectivity = normalize_field(product_data.get("connectivity"), str)
+                    color = normalize_field(product_data.get("color"), str)
+                    dealer_price_dp = normalize_field(product_data.get("dealer_price_dp"), float, 10000.0)
+                    mrp = normalize_field(product_data.get("mrp"), float, dealer_price_dp * 1.2)
+
+                    # Check if the product already exists
+                    cursor.execute(
+                        """SELECT product_id FROM products WHERE product_name=? AND product_code=?""",
+                        (product_name, product_code),
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        product_id = row[0]
+                    else:
                         cursor.execute(
-                            "SELECT product_id FROM products WHERE product_name = ?",
-                            (product_data.get('product_name', 'Unnamed Product'),)
-                        )
-                        
-                        product_result = cursor.fetchone()
-                        
-                        if product_result:
-                            product_id = product_result[0]
-                        else:
-                            # Insert new product
-                            cursor.execute("""
+                            """
                             INSERT INTO products (
                                 product_name, product_code, product_category, product_subcategory,
                                 ram, storage, connectivity, color, dealer_price_dp, mrp
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                product_data.get('product_name', 'Unnamed Product'),
-                                product_data.get('product_code', None),
-                                product_data.get('product_category', None),
-                                product_data.get('product_subcategory', None),
-                                product_data.get('ram', None),
-                                product_data.get('storage', None),
-                                product_data.get('connectivity', None),
-                                product_data.get('color', None),
-                                10000,  # Default dealer price
-                                12000   # Default MRP
-                            ))
-                            
-                            product_id = cursor.lastrowid
-                        
-                        # Insert scheme_product relationship
-                        cursor.execute("""
+                            """,
+                            (
+                                product_name,
+                                product_code,
+                                product_category,
+                                product_subcategory,
+                                ram,
+                                storage,
+                                connectivity,
+                                color,
+                                dealer_price_dp,
+                                mrp,
+                            ),
+                        )
+                        product_id = cursor.lastrowid
+
+                    # --- 2.d  Insert into scheme_products (also normalised) ------
+                    support_type = normalize_field(product_data.get("support_type"), str, scheme_type)
+                    payout_type = normalize_field(product_data.get("payout_type"), str, "Fixed")
+                    payout_amount = normalize_field(product_data.get("payout_amount"), float, 0.0)
+                    payout_unit = normalize_field(product_data.get("payout_unit"), str, "INR")
+                    dealer_contribution = normalize_field(product_data.get("dealer_contribution"), float, 0.0)
+                    total_payout = normalize_field(product_data.get("total_payout"), float, payout_amount)
+                    is_bundle_offer = 1 if product_data.get("is_bundle_offer", False) else 0
+                    bundle_price = normalize_field(product_data.get("bundle_price"), float)
+                    is_upgrade_offer = 1 if product_data.get("is_upgrade_offer", False) else 0
+                    free_item_description = normalize_field(product_data.get("free_item_description"), str)
+
+                    cursor.execute(
+                        """
                         INSERT INTO scheme_products (
                             scheme_id, product_id, support_type, payout_type, payout_amount,
                             payout_unit, dealer_contribution, total_payout, is_bundle_offer,
                             bundle_price, is_upgrade_offer, free_item_description
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
+                        """,
+                        (
                             scheme_id,
                             product_id,
-                            product_data.get('support_type', None),
-                            product_data.get('payout_type', 'Fixed'),
-                            product_data.get('payout_amount', 0),
-                            product_data.get('payout_unit', None),
-                            product_data.get('dealer_contribution', 0),
-                            product_data.get('total_payout', product_data.get('payout_amount', 0)),
-                            1 if product_data.get('is_bundle_offer', False) else 0,
-                            product_data.get('bundle_price', 0),
-                            1 if product_data.get('is_upgrade_offer', False) else 0,
-                            product_data.get('free_item_description', None)
-                        ))
-                
-                # Insert rules
-                if 'scheme_rules' in structured_data and structured_data['scheme_rules']:
-                    for rule_data in structured_data['scheme_rules']:
-                        cursor.execute("""
-                        INSERT INTO scheme_rules (
-                            scheme_id, rule_type, rule_description, rule_value
-                        ) VALUES (?, ?, ?, ?)
-                        """, (
+                            support_type,
+                            payout_type,
+                            payout_amount,
+                            payout_unit,
+                            dealer_contribution,
+                            total_payout,
+                            is_bundle_offer,
+                            bundle_price,
+                            is_upgrade_offer,
+                            free_item_description,
+                        ),
+                    )
+
+                # --- 2.e  Insert rules (also safe) ------------------------------
+                for rule_data in structured_data.get("scheme_rules", []):
+                    cursor.execute(
+                        """
+                        INSERT INTO scheme_rules (scheme_id, rule_type, rule_description, rule_value)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
                             scheme_id,
-                            rule_data.get('rule_type', None),
-                            rule_data.get('rule_description', None),
-                            rule_data.get('rule_value', None)
-                        ))
-                
+                            normalize_field(rule_data.get("rule_type"), str, "General"),
+                            normalize_field(rule_data.get("rule_description"), str, "No description"),
+                            normalize_field(rule_data.get("rule_value"), str),
+                        ),
+                    )
+
                 conn.commit()
                 st.success("Scheme saved to database successfully!")
-                
-                # Redirect to scheme explorer
-                st.session_state.page = 'schemes'
+                st.session_state.page = "schemes"
                 st.rerun()
-            
+
             except Exception as e:
-                if 'conn' in locals():
+                if "conn" in locals():
                     conn.rollback()
                 st.error(f"Error saving scheme to database: {str(e)}")
-            
+
             finally:
-                if 'conn' in locals():
+                if "conn" in locals():
                     conn.close()
+
 
 # Approvals
 def render_approvals():
@@ -1986,6 +2485,8 @@ def main():
         render_dealers()
     elif st.session_state.page == 'simulation':
         render_simulate_sales()
+    elif st.session_state.page == 'cart':
+        render_cart_mode()
     elif st.session_state.page == 'upload':
         render_upload_scheme()
     elif st.session_state.page == 'approvals':
